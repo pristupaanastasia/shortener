@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -132,7 +134,7 @@ func TestCreateKeyCollisions(t *testing.T) {
 			}
 			s := newTestService(store)
 			attempts := 0
-			s.generate = func(_ string, _ time.Time, attempt int) string {
+			s.generate = func(_ string, attempt int) string {
 				attempts++
 				return tt.candidates[min(attempt, len(tt.candidates)-1)]
 			}
@@ -301,4 +303,61 @@ func TestDelete(t *testing.T) {
 			break
 		}
 	}
+}
+
+// Regression: keys used to be salted with a millisecond timestamp, so
+// concurrent creates of one URL collided on every attempt.
+func TestCreateConcurrentSameURL(t *testing.T) {
+	tests := []struct {
+		name       string
+		goroutines int
+	}{
+		{name: "200 concurrent creates of one url", goroutines: 200},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := NewService(&lockedStore{m: mapStore{}}, "sho.rt")
+			var wg sync.WaitGroup
+			var failed atomic.Int32
+			for range tt.goroutines {
+				wg.Go(func() {
+					if _, err := s.Create(context.Background(), CreateParams{LongURL: "https://example.com/popular"}); err != nil {
+						failed.Add(1)
+					}
+				})
+			}
+			wg.Wait()
+			if n := failed.Load(); n != 0 {
+				t.Errorf("%d of %d creates failed", n, tt.goroutines)
+			}
+		})
+	}
+}
+
+// lockedStore makes mapStore safe for concurrent use.
+type lockedStore struct {
+	mu sync.Mutex
+	m  mapStore
+}
+
+func (s *lockedStore) Create(ctx context.Context, l Link) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.m.Create(ctx, l)
+}
+
+func (s *lockedStore) Get(ctx context.Context, key string) (Link, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.m.Get(ctx, key)
+}
+
+func (s *lockedStore) Update(ctx context.Context, l Link) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.m.Update(ctx, l)
+}
+
+func (s *lockedStore) ListByUser(ctx context.Context, userID, cursor string, limit int) ([]Link, string, error) {
+	return nil, "", nil
 }

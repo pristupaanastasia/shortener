@@ -24,7 +24,7 @@ type Service struct {
 	ownHost string
 	now     func() time.Time
 	// generate returns a candidate key; replaced in tests to force collisions.
-	generate func(longURL string, now time.Time, attempt int) string
+	generate func(longURL string, attempt int) string
 }
 
 // NewService returns a Service backed by store. ownHost is the service's own
@@ -34,7 +34,7 @@ func NewService(store Store, ownHost string) *Service {
 		store:    store,
 		ownHost:  ownHost,
 		now:      time.Now,
-		generate: keygen.Generate,
+		generate: func(longURL string, _ int) string { return keygen.Generate(longURL, keygen.NewSalt()) },
 	}
 }
 
@@ -82,7 +82,7 @@ func (s *Service) Create(ctx context.Context, p CreateParams) (Link, error) {
 	}
 
 	for attempt := range maxKeyAttempts {
-		l.Key = s.generate(p.LongURL, now, attempt)
+		l.Key = s.generate(p.LongURL, attempt)
 		err := s.store.Create(ctx, l)
 		if errors.Is(err, ErrKeyTaken) {
 			continue

@@ -573,21 +573,25 @@ The **Cleanup Worker** runs daily, finds links with `expires_at` in the past and
 ### Chosen Approach: Salted Hash + LWT + Retry
 
 ```go
-func generateKey(longURL string, attempt int) string {
-    // the salt makes shortening the same URL twice produce different keys (requirement 8)
-    input := fmt.Sprintf("%s|%d|%d", longURL, time.Now().UnixNano(), attempt)
-    sum := sha256.Sum256([]byte(input))
-    n := binary.BigEndian.Uint64(sum[:8]) % 3_521_614_606_208 // 62^7
+func Generate(longURL string, salt []byte) string {
+    // a fresh random salt per attempt (16 bytes from crypto/rand) makes
+    // shortening the same URL twice produce different keys (requirement 8)
+    h := sha256.New()
+    h.Write(salt)
+    h.Write([]byte(longURL))
+    n := binary.BigEndian.Uint64(h.Sum(nil)[:8]) % 3_521_614_606_208 // 62^7
     return toBase62(n, 7)
 }
 ```
+
+The salt must be random, not a timestamp: with a millisecond timestamp, concurrent requests for one popular URL got the same candidate keys on every attempt and failed (found in review: 190 of 200 concurrent creates), and keys were guessable from the creation time.
 
 Insertion:
 
 ```
 attempt = 0
 loop:
-    key = generateKey(url, attempt)
+    key = Generate(url, NewSalt())
     INSERT INTO links ... IF NOT EXISTS
     if not applied: attempt++, retry (up to ~5 attempts)
 ```
@@ -595,7 +599,7 @@ loop:
 **Pros:**
 
 - Simple: one function, no counters or extra infrastructure.
-- Unpredictable: a SHA-256 of a nanosecond-salted input cannot be guessed.
+- Unpredictable: the salt is 128 random bits, so keys cannot be guessed.
 - No coordination between instances.
 - LWT is needed anyway for custom aliases, so the uniqueness check adds no new mechanism.
 
@@ -603,7 +607,7 @@ loop:
 
 - **Collisions grow over time:** the chance that a new key is taken equals `used / total`, ~1% after a year (36B / 3.5T) and ~6% after 5 years (200B / 3.5T). Each collision costs an extra LWT round-trip.
 - **Every insert is an LWT** (~4× more expensive than a regular write). Acceptable at 1–3K write RPS.
-- Because of the salt, the hash no longer depends only on the URL, so this is effectively a random key: `crypto/rand` would work equally well. The hash is just a source of randomness.
+- Because of the salt, the hash no longer depends only on the URL, so this is effectively a random key. The hash is just a way to turn randomness into a key of the right size.
 
 **Why not hash only the URL:** the same URL would always get the same key (breaks requirement 8), and truncating the hash to 7 characters still produces collisions, so a uniqueness check is required anyway.
 
