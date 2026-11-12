@@ -48,17 +48,35 @@ func (s *Store) Get(_ context.Context, key string) (link.Link, error) {
 }
 
 // Update implements link.Store.
-func (s *Store) Update(_ context.Context, l link.Link) error {
+func (s *Store) Update(_ context.Context, l link.Link, f link.Fields) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	old, ok := s.links[l.Key]
+	cur, ok := s.links[l.Key]
+	if !ok || cur.DeletedAt != nil {
+		return link.ErrNotFound
+	}
+	if f.LongURL {
+		cur.LongURL = l.LongURL
+	}
+	if f.ExpiresAt {
+		cur.ExpiresAt = l.ExpiresAt
+	}
+	s.links[l.Key] = cur
+	return nil
+}
+
+// Delete implements link.Store.
+func (s *Store) Delete(_ context.Context, l link.Link) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, ok := s.links[l.Key]
 	if !ok {
 		return link.ErrNotFound
 	}
-	old.LongURL = l.LongURL
-	old.ExpiresAt = l.ExpiresAt
-	old.DeletedAt = l.DeletedAt
-	s.links[l.Key] = old
+	if cur.DeletedAt == nil {
+		cur.DeletedAt = l.DeletedAt
+		s.links[l.Key] = cur
+	}
 	return nil
 }
 

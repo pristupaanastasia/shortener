@@ -517,7 +517,8 @@ The cache is **not warmed** on creation: most links never become hot, and the fi
 
 1. API Gateway: auth, rate limit.
 2. Link Service checks that the link's `user_id` matches the API key owner; otherwise 404.
-3. Update both Cassandra tables with `QUORUM`.
+3. Update both Cassandra tables with `QUORUM`, writing **only the changed columns** with a lightweight transaction `IF created_at = ? AND deleted_at = null`. The link read in step 2 may be stale (another instance's cache), so the check that the link exists and is not deleted happens in the database: a stale read can neither undelete a link nor revert a concurrent change of another field. (Found in review: writing the whole row back let a PATCH through a stale cache resurrect a deleted link.)
+   - Delete sets `deleted_at` with the same kind of condition and always deletes the `links_by_user` row, so repeating a DELETE repairs a listing left behind by an earlier failure.
 4. Invalidate the cache with a **delayed double delete**: `DEL link:abc1234` in Redis and L1, and again after ~1 s. The second delete removes a stale value written back by a concurrent reader that loaded it from Cassandra before the update. Other instances' L1 entries expire within 10 s.
 5. Browsers pick up the change within ≤ 90 seconds (`max-age`).
 

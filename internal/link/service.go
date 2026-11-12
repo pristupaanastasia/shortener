@@ -136,19 +136,29 @@ func (s *Service) Update(ctx context.Context, userID, key string, p UpdateParams
 	if err != nil {
 		return Link{}, err
 	}
+	var f Fields
 	if p.LongURL != nil {
 		if err := validateURL(*p.LongURL, s.ownHost); err != nil {
 			return Link{}, err
 		}
-		l.LongURL = *p.LongURL
+		l.LongURL, f.LongURL = *p.LongURL, true
 	}
 	if p.SetExpiresAt {
 		if err := validateExpiry(p.ExpiresAt, s.now()); err != nil {
 			return Link{}, err
 		}
-		l.ExpiresAt = p.ExpiresAt
+		l.ExpiresAt, f.ExpiresAt = p.ExpiresAt, true
 	}
-	if err := s.store.Update(ctx, l); err != nil {
+	if !f.LongURL && !f.ExpiresAt {
+		return l, nil
+	}
+	// The read above may be stale (e.g. from another instance's cache): the
+	// store re-checks that the link is not deleted and writes only f.
+	err = s.store.Update(ctx, l, f)
+	if errors.Is(err, ErrNotFound) {
+		return Link{}, ErrNotFound
+	}
+	if err != nil {
 		return Link{}, fmt.Errorf("update link %q: %w", key, err)
 	}
 	return l, nil
@@ -164,12 +174,13 @@ func (s *Service) Delete(ctx context.Context, userID, key string) error {
 	if userID == "" || l.UserID != userID {
 		return ErrNotFound
 	}
-	if l.DeletedAt != nil {
-		return nil
+	// Even an already deleted link goes to the store: Delete is idempotent
+	// and repairs the owner's listing if an earlier attempt failed halfway.
+	if l.DeletedAt == nil {
+		now := s.timestamp()
+		l.DeletedAt = &now
 	}
-	now := s.timestamp()
-	l.DeletedAt = &now
-	if err := s.store.Update(ctx, l); err != nil {
+	if err := s.store.Delete(ctx, l); err != nil {
 		return fmt.Errorf("delete link %q: %w", key, err)
 	}
 	return nil

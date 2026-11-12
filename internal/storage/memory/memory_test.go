@@ -45,18 +45,45 @@ func TestStore(t *testing.T) {
 				t.Errorf("LongURL = %q: the duplicate overwrote the original", got.LongURL)
 			}
 		}},
-		{name: "update", run: func(t *testing.T) {
-			if err := s.Update(ctx, link.Link{Key: "abc1234", LongURL: "https://example.com/new", DeletedAt: &deleted}); err != nil {
+		{name: "update writes only selected fields", run: func(t *testing.T) {
+			if err := s.Update(ctx, link.Link{Key: "abc1234", LongURL: "https://example.com/new", ExpiresAt: &deleted}, link.Fields{LongURL: true}); err != nil {
 				t.Fatalf("Update: %v", err)
 			}
 			got, _ := s.Get(ctx, "abc1234")
-			if got.LongURL != "https://example.com/new" || got.DeletedAt == nil {
-				t.Errorf("after Update = %+v", got)
+			if got.LongURL != "https://example.com/new" || got.ExpiresAt != nil {
+				t.Errorf("after Update = %+v, want new url and no expiry", got)
 			}
 		}},
 		{name: "update missing", run: func(t *testing.T) {
-			if err := s.Update(ctx, link.Link{Key: "missing"}); !errors.Is(err, link.ErrNotFound) {
+			if err := s.Update(ctx, link.Link{Key: "missing"}, link.Fields{LongURL: true}); !errors.Is(err, link.ErrNotFound) {
 				t.Errorf("Update(missing) err = %v, want ErrNotFound", err)
+			}
+		}},
+		{name: "delete", run: func(t *testing.T) {
+			if err := s.Delete(ctx, link.Link{Key: "abc1234", DeletedAt: &deleted}); err != nil {
+				t.Fatalf("Delete: %v", err)
+			}
+			if got, _ := s.Get(ctx, "abc1234"); got.DeletedAt == nil || !got.DeletedAt.Equal(deleted) {
+				t.Errorf("DeletedAt = %v, want %v", got.DeletedAt, deleted)
+			}
+		}},
+		{name: "repeated delete keeps the first time", run: func(t *testing.T) {
+			later := deleted.Add(time.Hour)
+			if err := s.Delete(ctx, link.Link{Key: "abc1234", DeletedAt: &later}); err != nil {
+				t.Fatalf("Delete: %v", err)
+			}
+			if got, _ := s.Get(ctx, "abc1234"); !got.DeletedAt.Equal(deleted) {
+				t.Errorf("DeletedAt = %v, want %v", got.DeletedAt, deleted)
+			}
+		}},
+		{name: "update deleted", run: func(t *testing.T) {
+			if err := s.Update(ctx, link.Link{Key: "abc1234", LongURL: "https://x"}, link.Fields{LongURL: true}); !errors.Is(err, link.ErrNotFound) {
+				t.Errorf("Update(deleted) err = %v, want ErrNotFound", err)
+			}
+		}},
+		{name: "delete missing", run: func(t *testing.T) {
+			if err := s.Delete(ctx, link.Link{Key: "missing", DeletedAt: &deleted}); !errors.Is(err, link.ErrNotFound) {
+				t.Errorf("Delete(missing) err = %v, want ErrNotFound", err)
 			}
 		}},
 	}

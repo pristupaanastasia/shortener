@@ -29,11 +29,30 @@ func (m mapStore) Get(_ context.Context, key string) (Link, error) {
 	return l, nil
 }
 
-func (m mapStore) Update(_ context.Context, l Link) error {
-	if _, ok := m[l.Key]; !ok {
+func (m mapStore) Update(_ context.Context, l Link, f Fields) error {
+	cur, ok := m[l.Key]
+	if !ok || cur.DeletedAt != nil {
 		return ErrNotFound
 	}
-	m[l.Key] = l
+	if f.LongURL {
+		cur.LongURL = l.LongURL
+	}
+	if f.ExpiresAt {
+		cur.ExpiresAt = l.ExpiresAt
+	}
+	m[l.Key] = cur
+	return nil
+}
+
+func (m mapStore) Delete(_ context.Context, l Link) error {
+	cur, ok := m[l.Key]
+	if !ok {
+		return ErrNotFound
+	}
+	if cur.DeletedAt == nil {
+		cur.DeletedAt = l.DeletedAt
+		m[l.Key] = cur
+	}
 	return nil
 }
 
@@ -352,12 +371,85 @@ func (s *lockedStore) Get(ctx context.Context, key string) (Link, error) {
 	return s.m.Get(ctx, key)
 }
 
-func (s *lockedStore) Update(ctx context.Context, l Link) error {
+func (s *lockedStore) Update(ctx context.Context, l Link, f Fields) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.m.Update(ctx, l)
+	return s.m.Update(ctx, l, f)
+}
+
+func (s *lockedStore) Delete(ctx context.Context, l Link) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.m.Delete(ctx, l)
 }
 
 func (s *lockedStore) ListByUser(ctx context.Context, userID, cursor string, limit int) ([]Link, string, error) {
 	return nil, "", nil
+}
+
+// staleStore serves Get from a snapshot taken before later writes, like an
+// instance whose cache has not been invalidated yet.
+type staleStore struct {
+	mapStore
+	snapshot map[string]Link
+}
+
+func (s staleStore) Get(_ context.Context, key string) (Link, error) {
+	l, ok := s.snapshot[key]
+	if !ok {
+		return Link{}, ErrNotFound
+	}
+	return l, nil
+}
+
+// Regression: an update based on a stale read wrote every column back,
+// undeleting the link and reverting concurrent changes.
+func TestUpdateWithStaleRead(t *testing.T) {
+	newURL := "https://example.com/new"
+	expires := testNow.Add(time.Hour)
+
+	tests := []struct {
+		name        string
+		change      func(m mapStore) // applied after the stale snapshot
+		params      UpdateParams
+		wantErr     error
+		wantURL     string
+		wantExpires bool
+		wantDeleted bool
+	}{
+		{
+			name:        "deleted elsewhere stays deleted",
+			change:      func(m mapStore) { l := m["alice01"]; l.DeletedAt = ptr(testNow); m["alice01"] = l },
+			params:      UpdateParams{LongURL: &newURL},
+			wantErr:     ErrNotFound,
+			wantURL:     "https://example.com/a",
+			wantDeleted: true,
+		},
+		{
+			name:        "expiry set elsewhere survives a url change",
+			change:      func(m mapStore) { l := m["alice01"]; l.ExpiresAt = &expires; m["alice01"] = l },
+			params:      UpdateParams{LongURL: &newURL},
+			wantURL:     newURL,
+			wantExpires: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := ownershipStore()
+			snapshot := map[string]Link{}
+			for k, v := range m {
+				snapshot[k] = v
+			}
+			tt.change(m)
+
+			_, err := newTestService(staleStore{mapStore: m, snapshot: snapshot}).Update(context.Background(), alice, "alice01", tt.params)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("Update err = %v, want %v", err, tt.wantErr)
+			}
+			got := m["alice01"]
+			if got.LongURL != tt.wantURL || (got.ExpiresAt != nil) != tt.wantExpires || (got.DeletedAt != nil) != tt.wantDeleted {
+				t.Errorf("stored = %+v, want url %s, expiry %v, deleted %v", got, tt.wantURL, tt.wantExpires, tt.wantDeleted)
+			}
+		})
+	}
 }
