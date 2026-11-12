@@ -1,0 +1,73 @@
+# Runs on every push to any branch and on pull requests: lint, unit and
+# integration tests with the coverage minimum, and smoke tests of the running
+# service, in memory and against the full stack.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      cassandra:
+        image: cassandra:5.0
+        ports: ["9042:9042"]
+        env:
+          MAX_HEAP_SIZE: 1G
+          HEAP_NEWSIZE: 256M
+        options: >-
+          --health-cmd "cqlsh -e 'describe keyspaces'"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 30
+          --health-start-period 30s
+      redis:
+        image: redis:7.4
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-retries 10
+      postgres:
+        image: postgres:17
+        ports: ["5432:5432"]
+        env:
+          POSTGRES_USER: shortener
+          POSTGRES_PASSWORD: shortener # CI database only
+          POSTGRES_DB: shortener
+        options: >-
+          --health-cmd "pg_isready -U shortener"
+          --health-interval 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Lint
+        run: make lint
+
+      - name: Unit and integration tests with coverage minimum
+        run: make coverage
+
+      - name: Smoke test (in memory)
+        run: make smoke
+
+      - name: Smoke test (full stack)
+        run: make smoke-full
+
+      - name: Upload coverage profile
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+          if-no-files-found: ignore
