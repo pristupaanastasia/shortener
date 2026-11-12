@@ -4,14 +4,14 @@ Each milestone produces a working service. Work in order; the user reviews each 
 
 ## M1: In-Memory MVP
 
-- [ ] `cmd/shortener`: HTTP server with config from env (`ADDR`, `BASE_URL`) and graceful shutdown on SIGINT/SIGTERM
-- [ ] `internal/keygen`: salted SHA-256 → 7-character base62 key
-- [ ] `internal/storage`: `LinkStore` interface + in-memory implementation with an atomic "insert if not exists"
-- [ ] `internal/link`: service: URL validation, alias validation (4–30 chars, `[a-zA-Z0-9_-]`, reserved words), generate-and-retry on collision
-- [ ] `POST /api/v1/links` with `long_url`, optional `alias` and `expires_at`
-- [ ] `GET /{key}`: 301 + `Cache-Control: private, max-age=N` (`N = min(90, seconds until expiry)`), 404, 410
-- [ ] JSON error format from `README.md`
-- [ ] `GET /healthz`
+- [x] `cmd/shortener`: HTTP server with config from env (`ADDR`, `BASE_URL`) and graceful shutdown on SIGINT/SIGTERM
+- [x] `internal/keygen`: salted SHA-256 → 7-character base62 key
+- [x] `internal/storage`: `LinkStore` interface + in-memory implementation with an atomic "insert if not exists"
+- [x] `internal/link`: service: URL validation, alias validation (4–30 chars, `[a-zA-Z0-9_-]`, reserved words), generate-and-retry on collision
+- [x] `POST /api/v1/links` with `long_url`, optional `alias` and `expires_at`
+- [x] `GET /{key}`: 301 + `Cache-Control: private, max-age=N` (`N = min(90, seconds until expiry)`), 404, 410
+- [x] JSON error format from `README.md`
+- [x] `GET /healthz`
 
 **Done when:** `make check` passes; tests cover keygen, validation, collision retry and every status code of both endpoints; `make run` + curl creates a link and follows the redirect.
 

@@ -20,9 +20,9 @@ URL shortener in Go, built as a learning project for system design and agentic d
 cmd/shortener/      main: config, wiring, graceful shutdown
 internal/
   httpapi/          HTTP handlers, routing, middleware
-  link/             domain: Link type, validation, service logic
+  link/             domain: Link type, errors, Store interface, validation, service
   keygen/           key generation (salted hash + base62)
-  storage/          storage interfaces and implementations (memory, cassandra, ...)
+  storage/<impl>/   link.Store implementations (memory, cassandra, ...)
   cache/            Redis and in-process caches (from M3)
 ```
 
@@ -33,7 +33,7 @@ New packages go under `internal/`. Keep `cmd/` thin.
 - Go standard library first: `net/http` with Go 1.22+ routing patterns, `log/slog`, `context`. Add a dependency only when the stdlib has no reasonable equivalent.
 - Pass `context.Context` as the first argument to anything doing I/O.
 - Wrap errors with context: `fmt.Errorf("get link %q: %w", key, err)`. Use sentinel errors (`ErrNotFound`, `ErrAliasTaken`) for cases handlers map to HTTP codes.
-- Depend on interfaces at package boundaries (e.g. `storage.LinkStore`), so storage and caches can be swapped and faked in tests.
+- Depend on interfaces at package boundaries, declared by the consumer (e.g. `link.Store`), so storage and caches can be swapped and faked in tests.
 - No global state; configuration comes from environment variables, parsed in `main`.
 - Tests: table-driven, `httptest` for handlers, an in-memory store for unit tests. Integration tests that need Docker use the `integration` build tag.
 

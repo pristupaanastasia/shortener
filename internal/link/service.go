@@ -43,7 +43,7 @@ type CreateParams struct {
 // ErrAliasTaken if the alias exists. Without one, it generates keys and
 // retries on collision.
 func (s *Service) Create(ctx context.Context, p CreateParams) (Link, error) {
-	now := s.now()
+	now := s.now().UTC()
 	if err := validateURL(p.LongURL, s.ownHost); err != nil {
 		return Link{}, err
 	}
