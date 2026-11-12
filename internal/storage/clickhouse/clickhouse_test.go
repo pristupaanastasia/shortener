@@ -81,7 +81,7 @@ func TestMigrations(t *testing.T) {
 				tables = append(tables, name)
 			}
 			rows.Close()
-			for _, want := range []string{"clicks", "clicks_daily", "clicks_daily_mv", "clicks_by_dimension", "clicks_by_dimension_mv", "schema_migrations"} {
+			for _, want := range []string{"clicks", "clicks_daily", "clicks_daily_mv", "clicks_by_dimension", "clicks_by_dimension_mv", "clicks_last", "clicks_last_mv", "schema_migrations"} {
 				if !slices.Contains(tables, want) {
 					t.Errorf("table %s missing; tables = %v", want, tables)
 				}
@@ -268,6 +268,123 @@ func TestLazyStats(t *testing.T) {
 			_, err := l.Stats(ctx, "nothing", day, day)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("Stats err = %v, want error: %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// Regression: updated_at came from the raw clicks table, which expires after
+// 90 days, so it turned null while the aggregates still had clicks.
+func TestLastClickOutlivesRawClicks(t *testing.T) {
+	ctx := context.Background()
+	dsn, admin := freshDatabase(t)
+	opts, _ := ch.ParseDSN(dsn)
+	s, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	last := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	if err := s.Insert(ctx, []analytics.Row{
+		{Key: "old", Time: last.Add(-time.Hour), Country: "DE", Device: "mobile", Referrer: "direct"},
+		{Key: "old", Time: last, Country: "DE", Device: "mobile", Referrer: "direct"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	day := last.Truncate(24 * time.Hour)
+
+	steps := []struct {
+		name      string
+		before    func(t *testing.T)
+		wantTotal uint64
+	}{
+		{name: "with raw clicks", wantTotal: 2},
+		{name: "after raw clicks expired", wantTotal: 2, before: func(t *testing.T) {
+			// What the 90-day TTL does: the raw rows disappear.
+			if err := admin.Exec(ctx, "ALTER TABLE "+opts.Auth.Database+".clicks DELETE WHERE key = 'old' SETTINGS mutations_sync = 1"); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, step := range steps {
+		ok := t.Run(step.name, func(t *testing.T) {
+			if step.before != nil {
+				step.before(t)
+			}
+			st, err := s.Stats(ctx, "old", day, day)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if st.Total != step.wantTotal || !st.LastClick.Equal(last) {
+				t.Errorf("Stats = total %d, last click %v; want %d, %v", st.Total, st.LastClick, step.wantTotal, last)
+			}
+		})
+		if !ok {
+			break
+		}
+	}
+}
+
+// The backfill in 0004 must work on a database that already has clicks.
+func TestLastClickBackfill(t *testing.T) {
+	ctx := context.Background()
+	dsn, admin := freshDatabase(t)
+	opts, _ := ch.ParseDSN(dsn)
+	db := opts.Auth.Database
+	ts := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name string
+	}{
+		{name: "clicks inserted before migration 0004 get a last click"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Apply migrations 0001-0003 only, as on a database created before
+			// 0004, through a connection to that database (statements are
+			// unqualified).
+			conn, err := ch.Open(opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			all, err := migrate.Load(migrations.ClickHouse, "clickhouse")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, m := range all {
+				if m.Version >= 4 {
+					continue
+				}
+				for _, stmt := range m.Statements {
+					if err := conn.Exec(ctx, stmt); err != nil {
+						t.Fatalf("%s: %v", m.Name, err)
+					}
+				}
+			}
+			if err := admin.Exec(ctx, "INSERT INTO "+db+".clicks VALUES ('pre', ?, 'DE', 'mobile', 'direct')", ts); err != nil {
+				t.Fatal(err)
+			}
+			if err := admin.Exec(ctx, "CREATE TABLE "+db+".schema_migrations (version UInt32, name String, applied_at DateTime DEFAULT now()) ENGINE = ReplacingMergeTree ORDER BY version"); err != nil {
+				t.Fatal(err)
+			}
+			for _, v := range []uint32{1, 2, 3} {
+				if err := admin.Exec(ctx, "INSERT INTO "+db+".schema_migrations (version, name) VALUES (?, 'pre')", v); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			s, err := Open(ctx, dsn) // applies 0004
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+			st, err := s.Stats(ctx, "pre", ts.Truncate(24*time.Hour), ts.Truncate(24*time.Hour))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !st.LastClick.Equal(ts) {
+				t.Errorf("LastClick = %v, want %v from the backfill", st.LastClick, ts)
 			}
 		})
 	}

@@ -169,8 +169,8 @@ func (s *Store) Stats(ctx context.Context, key string, from, to time.Time) (anal
 		return analytics.Stats{}, fmt.Errorf("query dimensions: %w", err)
 	}
 
-	// The sort key starts with key, so this reads only this link's rows.
-	if err := s.conn.QueryRow(ctx, `SELECT max(ts) FROM clicks WHERE key = ?`, key).Scan(&st.LastClick); err != nil {
+	// From clicks_last, not clicks: raw clicks expire after 90 days.
+	if err := s.conn.QueryRow(ctx, `SELECT max(last_ts) FROM clicks_last WHERE key = ?`, key).Scan(&st.LastClick); err != nil {
 		return analytics.Stats{}, fmt.Errorf("query last click: %w", err)
 	}
 	if st.LastClick.Unix() <= 0 {
