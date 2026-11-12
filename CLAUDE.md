@@ -13,6 +13,7 @@ URL shortener in Go, built as a learning project for system design and agentic d
 - `make test`: tests only.
 - `make test-integration`: unit + integration tests (`integration` build tag); needs `make up`. Run it before committing changes to storage, caches or queues.
 - `make run`: start the service locally.
+- `make hooks`: enable the git `pre-push` hook (lint + tests; integration tests too when `make up` is running). Run once per clone.
 - `make up` / `make down`: start/stop infrastructure from `docker-compose.yml` (from M2 on).
 
 ## Project Layout
@@ -36,7 +37,7 @@ New packages go under `internal/`. Keep `cmd/` thin.
 - Wrap errors with context: `fmt.Errorf("get link %q: %w", key, err)`. Use sentinel errors (`ErrNotFound`, `ErrAliasTaken`) for cases handlers map to HTTP codes.
 - Depend on interfaces at package boundaries, declared by the consumer (e.g. `link.Store`), so storage and caches can be swapped and faked in tests.
 - No global state; configuration comes from environment variables, parsed in `main`.
-- Tests: table-driven, `httptest` for handlers, an in-memory store for unit tests. Integration tests that need Docker use the `integration` build tag.
+- Tests: always table-driven, cases in a slice run with `for range` + `t.Run` (the `go-table-tests` skill in `.claude/skills/` has the exact format). `httptest` for handlers, an in-memory store for unit tests. Integration tests that need Docker use the `integration` build tag.
 
 ## Workflow
 

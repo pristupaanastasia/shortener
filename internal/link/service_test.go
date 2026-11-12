@@ -27,6 +27,19 @@ func (m mapStore) Get(_ context.Context, key string) (Link, error) {
 	return l, nil
 }
 
+func (m mapStore) Update(_ context.Context, l Link) error {
+	if _, ok := m[l.Key]; !ok {
+		return ErrNotFound
+	}
+	m[l.Key] = l
+	return nil
+}
+
+// ListByUser is not exercised here: listing is tested against the real stores.
+func (m mapStore) ListByUser(context.Context, string, string, int) ([]Link, string, error) {
+	return nil, "", nil
+}
+
 var testNow = time.Date(2026, 11, 12, 10, 0, 0, 0, time.UTC)
 
 func newTestService(store Store) *Service {
@@ -141,5 +154,101 @@ func TestResolve(t *testing.T) {
 				t.Errorf("err = %v, want %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+const (
+	alice = "11111111-1111-4111-8111-111111111111"
+	bob   = "22222222-2222-4222-8222-222222222222"
+)
+
+func ownershipStore() mapStore {
+	return mapStore{
+		"alice01": {Key: "alice01", LongURL: "https://example.com/a", UserID: alice},
+		"anon001": {Key: "anon001", LongURL: "https://example.com/anon"},
+		"gone001": {Key: "gone001", LongURL: "https://example.com/gone", UserID: alice, DeletedAt: ptr(testNow)},
+	}
+}
+
+func TestGetOwnership(t *testing.T) {
+	tests := []struct {
+		name, user, key string
+		wantErr         error
+	}{
+		{"owner", alice, "alice01", nil},
+		{"other user", bob, "alice01", ErrNotFound},
+		{"no user", "", "alice01", ErrNotFound},
+		{"anonymous link", alice, "anon001", ErrNotFound},
+		{"deleted link", alice, "gone001", ErrNotFound},
+		{"missing", alice, "missing", ErrNotFound},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := newTestService(ownershipStore()).Get(context.Background(), tt.user, tt.key)
+			if !errors.Is(err, tt.wantErr) {
+				t.Errorf("err = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestUpdate(t *testing.T) {
+	ctx := context.Background()
+	store := ownershipStore()
+	s := newTestService(store)
+
+	newURL := "https://example.com/new"
+	expires := testNow.Add(time.Hour)
+	l, err := s.Update(ctx, alice, "alice01", UpdateParams{LongURL: &newURL, SetExpiresAt: true, ExpiresAt: &expires})
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if l.LongURL != newURL || store["alice01"].LongURL != newURL || !store["alice01"].ExpiresAt.Equal(expires) {
+		t.Errorf("link not updated: returned %+v, stored %+v", l, store["alice01"])
+	}
+
+	// Clearing the expiration makes the link permanent; the URL stays.
+	if _, err := s.Update(ctx, alice, "alice01", UpdateParams{SetExpiresAt: true}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if store["alice01"].ExpiresAt != nil || store["alice01"].LongURL != newURL {
+		t.Errorf("stored %+v, want permanent link to %s", store["alice01"], newURL)
+	}
+
+	if _, err := s.Update(ctx, bob, "alice01", UpdateParams{LongURL: &newURL}); !errors.Is(err, ErrNotFound) {
+		t.Errorf("other user: err = %v, want ErrNotFound", err)
+	}
+	bad := "ftp://example.com"
+	if _, err := s.Update(ctx, alice, "alice01", UpdateParams{LongURL: &bad}); !errors.Is(err, ErrInvalidURL) {
+		t.Errorf("invalid url: err = %v, want ErrInvalidURL", err)
+	}
+	past := testNow.Add(-time.Hour)
+	if _, err := s.Update(ctx, alice, "alice01", UpdateParams{SetExpiresAt: true, ExpiresAt: &past}); !errors.Is(err, ErrInvalidExpiry) {
+		t.Errorf("past expiry: err = %v, want ErrInvalidExpiry", err)
+	}
+}
+
+func TestDelete(t *testing.T) {
+	ctx := context.Background()
+	store := ownershipStore()
+	s := newTestService(store)
+
+	if err := s.Delete(ctx, bob, "alice01"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("other user: err = %v, want ErrNotFound", err)
+	}
+	if err := s.Delete(ctx, alice, "alice01"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if store["alice01"].DeletedAt == nil {
+		t.Fatal("link was not soft-deleted")
+	}
+	if _, err := s.Resolve(ctx, "alice01"); !errors.Is(err, ErrGone) {
+		t.Errorf("Resolve after delete: err = %v, want ErrGone", err)
+	}
+	if err := s.Delete(ctx, alice, "alice01"); err != nil {
+		t.Errorf("repeated Delete: err = %v, want nil (idempotent)", err)
+	}
+	if err := s.Delete(ctx, alice, "anon001"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("anonymous link: err = %v, want ErrNotFound", err)
 	}
 }

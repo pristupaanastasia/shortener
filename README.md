@@ -142,6 +142,14 @@ The network is not a bottleneck.
   ```
   When the limit is exceeded, the service returns `429 Too Many Requests` with `Retry-After: <seconds>`.
 
+  Implementation details:
+  - **Fixed window** of one minute, a counter per subject in Redis (`INCR` + `EXPIRE` in one transaction), shared by all instances. The simplest algorithm; the trade-off is a burst of up to 2× the limit around a window boundary.
+  - **Limits:** 100 requests/min per user, 10 requests/min per IP for requests without a valid API key.
+  - The limit is checked **before** an invalid API key is rejected, so guessing keys counts against the IP quota.
+  - The client IP is the TCP peer address. `X-Forwarded-For` is not trusted: behind a load balancer, read only the balancer's own header.
+  - If Redis is unavailable, requests are allowed (fail open): rate limiting must not take the API down.
+  - Redirects (`GET /{key}`) are not rate limited.
+
 ### Endpoints
 
 | Method | Path | Auth | Requirement |
@@ -153,8 +161,33 @@ The network is not a bottleneck.
 | PATCH | `/api/v1/links/{key}` | required | 7 |
 | DELETE | `/api/v1/links/{key}` | required | 7 |
 | GET | `/api/v1/links/{key}/stats` | required | 5 |
+| POST | `/api/v1/users` | none | 6 |
 
-User registration and API key management are standard auth and are not detailed here.
+#### Register
+
+```
+POST /api/v1/users
+```
+```json
+{ "email": "alice@example.com" }
+```
+
+**201 Created**
+```json
+{
+  "user_id": "0b0d7a4e-...",
+  "email": "alice@example.com",
+  "api_key": "sk_...",
+  "created_at": "2026-11-12T13:00:00Z"
+}
+```
+
+| Code | When |
+|---|---|
+| 400 | invalid email |
+| 409 | email already registered |
+
+The API key is returned **only once**: PostgreSQL stores its SHA-256 hash, never the key itself. A fast hash is enough because keys are random (~130 bits), so there is nothing to brute-force. Key rotation and revocation (`api_keys.revoked_at`) are supported by the schema but have no endpoints yet.
 
 #### Create a link
 
@@ -190,7 +223,13 @@ Idempotency-Key: <uuid>             (optional)
 | 409 | alias already taken |
 | 429 | rate limit exceeded |
 
-`Idempotency-Key`: since URLs are not deduplicated, a retried request (e.g. after a timeout) would create a second link. The server stores the key (e.g. for 24 hours) and returns the original response on retries.
+`Idempotency-Key`: since URLs are not deduplicated, a retried request (e.g. after a timeout) would create a second link. The server stores the key for 24 hours in Redis and returns the original response on retries, with the header `Idempotent-Replayed: true`.
+
+- Keys are scoped per user (per IP for anonymous requests): two users can use the same key independently.
+- The request body is fingerprinted: reusing a key with a different body returns `422 idempotency_key_reused`.
+- While the first request is still running, a retry gets `409 idempotency_in_progress`.
+- Responses with a server error (5xx) are not stored: the key is released, so a retry runs again. Client errors (4xx) are deterministic and are replayed.
+- If Redis is unavailable, the request is processed without idempotency.
 
 #### Redirect
 

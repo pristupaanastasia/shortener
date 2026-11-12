@@ -1,5 +1,5 @@
 // Package link holds the link domain: the Link type, validation and the
-// service that creates and resolves links.
+// service that creates, resolves and manages links.
 package link
 
 import (
@@ -16,6 +16,7 @@ var (
 	ErrInvalidURL    = errors.New("invalid url")
 	ErrInvalidAlias  = errors.New("invalid alias")
 	ErrInvalidExpiry = errors.New("invalid expiration")
+	ErrInvalidCursor = errors.New("invalid cursor")
 )
 
 // ErrKeyTaken is returned by a Store when a link with the same key exists.
@@ -46,4 +47,12 @@ type Store interface {
 	Create(ctx context.Context, l Link) error
 	// Get returns the link with the given key, or ErrNotFound.
 	Get(ctx context.Context, key string) (Link, error)
+	// Update replaces the mutable fields (LongURL, ExpiresAt, DeletedAt) of an
+	// existing link, or returns ErrNotFound. A deleted link is removed from
+	// its owner's listing.
+	Update(ctx context.Context, l Link) error
+	// ListByUser returns up to limit non-deleted links of a user, newest
+	// first, and a cursor for the next page ("" when there are no more).
+	// The cursor is opaque and specific to the store.
+	ListByUser(ctx context.Context, userID, cursor string, limit int) ([]Link, string, error)
 }

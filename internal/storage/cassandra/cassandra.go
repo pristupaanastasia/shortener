@@ -4,6 +4,7 @@ package cassandra
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"regexp"
@@ -31,6 +32,10 @@ type Store struct {
 	insertLink       string
 	insertLinkByUser string
 	selectLink       string
+	updateLink       string
+	updateLinkByUser string
+	deleteLinkByUser string
+	listLinksByUser  string
 }
 
 // Open connects to Cassandra, creates the keyspace and tables if they do not
@@ -67,6 +72,14 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 			VALUES (?, ?, ?, ?, ?)`, ks),
 		selectLink: fmt.Sprintf(`SELECT long_url, user_id, created_at, expires_at, deleted_at
 			FROM %s.links WHERE key = ?`, ks),
+		updateLink: fmt.Sprintf(`UPDATE %s.links SET long_url = ?, expires_at = ?, deleted_at = ?
+			WHERE key = ? IF EXISTS`, ks),
+		updateLinkByUser: fmt.Sprintf(`UPDATE %s.links_by_user SET long_url = ?, expires_at = ?
+			WHERE user_id = ? AND created_at = ? AND key = ?`, ks),
+		deleteLinkByUser: fmt.Sprintf(`DELETE FROM %s.links_by_user
+			WHERE user_id = ? AND created_at = ? AND key = ?`, ks),
+		listLinksByUser: fmt.Sprintf(`SELECT key, long_url, created_at, expires_at
+			FROM %s.links_by_user WHERE user_id = ?`, ks),
 	}, nil
 }
 
@@ -154,6 +167,70 @@ func (s *Store) Get(ctx context.Context, key string) (link.Link, error) {
 		l.UserID = userID.String()
 	}
 	return l, nil
+}
+
+// Update implements link.Store. The links row is updated with a lightweight
+// transaction (IF EXISTS), so an update never creates a row; links_by_user is
+// then brought in line: updated, or removed for a deleted link.
+func (s *Store) Update(ctx context.Context, l link.Link) error {
+	applied, err := s.session.Query(s.updateLink,
+		l.LongURL, l.ExpiresAt, l.DeletedAt, l.Key,
+	).MapScanCASContext(ctx, map[string]any{})
+	if err != nil {
+		return fmt.Errorf("update link %q: %w", l.Key, err)
+	}
+	if !applied {
+		return link.ErrNotFound
+	}
+
+	userID, err := parseUserID(l.UserID)
+	if err != nil || userID == nil {
+		return err
+	}
+	q := s.session.Query(s.updateLinkByUser, l.LongURL, l.ExpiresAt, userID, l.CreatedAt, l.Key)
+	if l.DeletedAt != nil {
+		q = s.session.Query(s.deleteLinkByUser, userID, l.CreatedAt, l.Key)
+	}
+	if err := q.ExecContext(ctx); err != nil {
+		return fmt.Errorf("update link %q in links_by_user: %w", l.Key, err)
+	}
+	return nil
+}
+
+// ListByUser implements link.Store. The cursor is Cassandra's paging state,
+// base64-encoded: the database itself tracks where the next page starts.
+func (s *Store) ListByUser(ctx context.Context, userID, cursor string, limit int) ([]link.Link, string, error) {
+	uid, err := parseUserID(userID)
+	if err != nil || uid == nil {
+		return nil, "", link.ErrNotFound
+	}
+	var state []byte
+	if cursor != "" {
+		if state, err = base64.RawURLEncoding.DecodeString(cursor); err != nil {
+			return nil, "", link.ErrInvalidCursor
+		}
+	}
+
+	iter := s.session.Query(s.listLinksByUser, uid).PageSize(limit).PageState(state).IterContext(ctx)
+	var links []link.Link
+	for range limit {
+		l := link.Link{UserID: userID}
+		if !iter.Scan(&l.Key, &l.LongURL, &l.CreatedAt, &l.ExpiresAt) {
+			break
+		}
+		links = append(links, l)
+	}
+	next := iter.PageState()
+	if err := iter.Close(); err != nil {
+		return nil, "", fmt.Errorf("list links of user %q: %w", userID, err)
+	}
+
+	// Cassandra may return a paging state even when the next page is empty;
+	// a short page means there is nothing more.
+	if len(links) < limit || len(next) == 0 {
+		return links, "", nil
+	}
+	return links, base64.RawURLEncoding.EncodeToString(next), nil
 }
 
 // parseUserID returns nil for anonymous links (empty id).

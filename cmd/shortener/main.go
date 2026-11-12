@@ -15,27 +15,33 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pristupaanastasia/shortener/internal/account"
 	"github.com/pristupaanastasia/shortener/internal/cache"
 	"github.com/pristupaanastasia/shortener/internal/httpapi"
+	"github.com/pristupaanastasia/shortener/internal/idempotency"
 	"github.com/pristupaanastasia/shortener/internal/link"
+	"github.com/pristupaanastasia/shortener/internal/ratelimit"
 	"github.com/pristupaanastasia/shortener/internal/storage/cassandra"
 	"github.com/pristupaanastasia/shortener/internal/storage/memory"
+	"github.com/pristupaanastasia/shortener/internal/storage/postgres"
 )
 
 type config struct {
-	addr      string
-	baseURL   string
-	storage   string
-	cassandra cassandra.Config
-	redisAddr string // empty: no cache
+	addr        string
+	baseURL     string
+	storage     string
+	cassandra   cassandra.Config
+	redisAddr   string // empty: no cache, rate limiting or idempotency
+	postgresDSN string // empty: in-memory accounts
 }
 
 func loadConfig() (config, error) {
 	cfg := config{
-		addr:      getenv("ADDR", ":8080"),
-		baseURL:   getenv("BASE_URL", "http://localhost:8080"),
-		storage:   getenv("STORAGE", "memory"),
-		redisAddr: os.Getenv("REDIS_ADDR"),
+		addr:        getenv("ADDR", ":8080"),
+		baseURL:     getenv("BASE_URL", "http://localhost:8080"),
+		storage:     getenv("STORAGE", "memory"),
+		redisAddr:   os.Getenv("REDIS_ADDR"),
+		postgresDSN: os.Getenv("POSTGRES_DSN"),
 		cassandra: cassandra.Config{
 			Hosts:    strings.Split(getenv("CASSANDRA_HOSTS", "127.0.0.1"), ","),
 			Keyspace: getenv("CASSANDRA_KEYSPACE", "shortener"),
@@ -50,6 +56,19 @@ func loadConfig() (config, error) {
 	}
 	cfg.cassandra.ReplicationFactor = rf
 	return cfg, nil
+}
+
+// openAccounts returns the configured account store and a function that
+// releases it.
+func openAccounts(ctx context.Context, cfg config) (account.Store, func(), error) {
+	if cfg.postgresDSN == "" {
+		return memory.NewAccounts(), func() {}, nil
+	}
+	a, err := postgres.Open(ctx, cfg.postgresDSN)
+	if err != nil {
+		return nil, nil, err
+	}
+	return a, a.Close, nil
 }
 
 // openStore returns the configured link store and a function that releases it.
@@ -99,6 +118,13 @@ func run(logger *slog.Logger) error {
 	}
 	defer closeStore()
 
+	accounts, closeAccounts, err := openAccounts(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer closeAccounts()
+
+	api := httpapi.Config{BaseURL: cfg.baseURL, Logger: logger}
 	if cfg.redisAddr != "" {
 		rdb := cache.NewRedisClient(cfg.redisAddr)
 		defer rdb.Close()
@@ -108,12 +134,17 @@ func run(logger *slog.Logger) error {
 			logger.Warn("redis unavailable, serving from storage until it recovers", "err", err)
 		}
 		store = cached
+		api.Limiter = ratelimit.New(rdb)
+		api.Idempotency = idempotency.New(rdb, idempotency.DefaultTTL)
+	} else {
+		logger.Warn("REDIS_ADDR is not set: caching, rate limiting and Idempotency-Key are disabled")
 	}
+	api.Links = link.NewService(store, baseURL.Host)
+	api.Accounts = account.NewService(accounts)
 
-	links := link.NewService(store, baseURL.Host)
 	srv := &http.Server{
 		Addr:              cfg.addr,
-		Handler:           httpapi.New(links, cfg.baseURL, logger),
+		Handler:           httpapi.New(api),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
@@ -122,7 +153,7 @@ func run(logger *slog.Logger) error {
 
 	errc := make(chan error, 1)
 	go func() {
-		logger.Info("listening", "addr", cfg.addr, "base_url", cfg.baseURL, "storage", cfg.storage, "cache", cfg.redisAddr != "")
+		logger.Info("listening", "addr", cfg.addr, "base_url", cfg.baseURL, "storage", cfg.storage, "redis", cfg.redisAddr != "", "postgres", cfg.postgresDSN != "")
 		errc <- srv.ListenAndServe()
 	}()
 

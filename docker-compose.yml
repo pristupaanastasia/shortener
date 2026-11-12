@@ -30,5 +30,22 @@ services:
       timeout: 3s
       retries: 10
 
+  postgres:
+    image: postgres:17
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: shortener
+      POSTGRES_PASSWORD: shortener # local development only
+      POSTGRES_DB: shortener
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "shortener"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
 volumes:
   cassandra-data:
+  postgres-data:
