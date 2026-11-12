@@ -46,37 +46,77 @@ func decodeError(t *testing.T, rec *httptest.ResponseRecorder) errorBody {
 
 func TestCreateLink(t *testing.T) {
 	h, _ := newTestHandler(t)
+	var firstKey string
 
-	rec := do(h, http.MethodPost, "/api/v1/links", `{"long_url":"https://example.com/a"}`)
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("status = %d, want 201; body: %s", rec.Code, rec.Body)
+	steps := []struct {
+		name       string
+		method     string
+		path       string
+		body       string
+		wantStatus int
+		check      func(t *testing.T, rec *httptest.ResponseRecorder)
+	}{
+		{
+			name: "generated key", method: http.MethodPost, path: "/api/v1/links",
+			body: `{"long_url":"https://example.com"}`, wantStatus: http.StatusCreated,
+			check: func(t *testing.T, rec *httptest.ResponseRecorder) {
+				var resp linkResponse
+				if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+					t.Fatal(err)
+				}
+				if len(resp.Key) != 7 || resp.ShortURL != "https://sho.rt/"+resp.Key || resp.LongURL != "https://example.com" {
+					t.Errorf("response = %+v", resp)
+				}
+				firstKey = resp.Key
+			},
+		},
+		{
+			name: "same url again gets a new key", method: http.MethodPost, path: "/api/v1/links",
+			body: `{"long_url":"https://example.com"}`, wantStatus: http.StatusCreated,
+			check: func(t *testing.T, rec *httptest.ResponseRecorder) {
+				var resp linkResponse
+				_ = json.NewDecoder(rec.Body).Decode(&resp)
+				if resp.Key == firstKey {
+					t.Errorf("key %q was reused", resp.Key)
+				}
+			},
+		},
+		{
+			name: "alias", method: http.MethodPost, path: "/api/v1/links",
+			body: `{"long_url":"https://example.com/x","alias":"mylink"}`, wantStatus: http.StatusCreated,
+		},
+		{
+			name: "alias taken", method: http.MethodPost, path: "/api/v1/links",
+			body: `{"long_url":"https://example.com/y","alias":"mylink"}`, wantStatus: http.StatusConflict,
+			check: func(t *testing.T, rec *httptest.ResponseRecorder) {
+				if got := decodeError(t, rec).Code; got != "alias_taken" {
+					t.Errorf("code = %q, want alias_taken", got)
+				}
+			},
+		},
+		{
+			name: "alias redirects to the first url", method: http.MethodGet, path: "/mylink",
+			wantStatus: http.StatusMovedPermanently,
+			check: func(t *testing.T, rec *httptest.ResponseRecorder) {
+				if got := rec.Header().Get("Location"); got != "https://example.com/x" {
+					t.Errorf("Location = %q", got)
+				}
+			},
+		},
 	}
-	var resp linkResponse
-	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if len(resp.Key) != 7 {
-		t.Errorf("key = %q, want 7 characters", resp.Key)
-	}
-	if resp.ShortURL != "https://sho.rt/"+resp.Key {
-		t.Errorf("short_url = %q", resp.ShortURL)
-	}
-	if resp.LongURL != "https://example.com/a" {
-		t.Errorf("long_url = %q", resp.LongURL)
-	}
-}
-
-func TestCreateLinkSameURLTwiceGivesNewKeys(t *testing.T) {
-	h, _ := newTestHandler(t)
-	keys := map[string]bool{}
-	for range 2 {
-		rec := do(h, http.MethodPost, "/api/v1/links", `{"long_url":"https://example.com"}`)
-		var resp linkResponse
-		_ = json.NewDecoder(rec.Body).Decode(&resp)
-		keys[resp.Key] = true
-	}
-	if len(keys) != 2 {
-		t.Errorf("got keys %v, want two different keys", keys)
+	for _, step := range steps {
+		ok := t.Run(step.name, func(t *testing.T) {
+			rec := do(h, step.method, step.path, step.body)
+			if rec.Code != step.wantStatus {
+				t.Fatalf("%s %s: status = %d, want %d; body: %s", step.method, step.path, rec.Code, step.wantStatus, rec.Body)
+			}
+			if step.check != nil {
+				step.check(t, rec)
+			}
+		})
+		if !ok {
+			break
+		}
 	}
 }
 
@@ -87,11 +127,11 @@ func TestCreateLinkErrors(t *testing.T) {
 		wantStatus int
 		wantCode   string
 	}{
-		{"malformed json", `{`, http.StatusBadRequest, "invalid_request"},
-		{"unknown field", `{"long_url":"https://example.com","foo":1}`, http.StatusBadRequest, "invalid_request"},
-		{"invalid url", `{"long_url":"ftp://example.com"}`, http.StatusBadRequest, "invalid_url"},
-		{"invalid alias", `{"long_url":"https://example.com","alias":"a/b"}`, http.StatusBadRequest, "invalid_alias"},
-		{"expiry in past", `{"long_url":"https://example.com","expires_at":"2000-01-01T00:00:00Z"}`, http.StatusBadRequest, "invalid_expires_at"},
+		{name: "malformed json", body: `{`, wantStatus: http.StatusBadRequest, wantCode: "invalid_request"},
+		{name: "unknown field", body: `{"long_url":"https://example.com","foo":1}`, wantStatus: http.StatusBadRequest, wantCode: "invalid_request"},
+		{name: "invalid url", body: `{"long_url":"ftp://example.com"}`, wantStatus: http.StatusBadRequest, wantCode: "invalid_url"},
+		{name: "invalid alias", body: `{"long_url":"https://example.com","alias":"a/b"}`, wantStatus: http.StatusBadRequest, wantCode: "invalid_alias"},
+		{name: "expiry in past", body: `{"long_url":"https://example.com","expires_at":"2000-01-01T00:00:00Z"}`, wantStatus: http.StatusBadRequest, wantCode: "invalid_expires_at"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -107,22 +147,6 @@ func TestCreateLinkErrors(t *testing.T) {
 	}
 }
 
-func TestCreateLinkAliasTaken(t *testing.T) {
-	h, _ := newTestHandler(t)
-	body := `{"long_url":"https://example.com","alias":"sale2026"}`
-
-	if rec := do(h, http.MethodPost, "/api/v1/links", body); rec.Code != http.StatusCreated {
-		t.Fatalf("first create: status = %d", rec.Code)
-	}
-	rec := do(h, http.MethodPost, "/api/v1/links", body)
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("second create: status = %d, want 409", rec.Code)
-	}
-	if got := decodeError(t, rec); got.Code != "alias_taken" {
-		t.Errorf("code = %q, want alias_taken", got.Code)
-	}
-}
-
 func TestRedirect(t *testing.T) {
 	// The service checks expiry with the real clock, so times are relative to
 	// time.Now(); the handler's clock is pinned to it for exact max-age values.
@@ -132,35 +156,35 @@ func TestRedirect(t *testing.T) {
 
 	h, store := newTestHandler(t)
 	h.now = func() time.Time { return now }
-	ctx := context.Background()
 	for _, l := range []link.Link{
 		{Key: "forever", LongURL: "https://example.com/forever"},
 		{Key: "soon123", LongURL: "https://example.com/soon", ExpiresAt: &soon},
 		{Key: "expired", LongURL: "https://example.com/expired", ExpiresAt: &past},
 		{Key: "deleted", LongURL: "https://example.com/deleted", DeletedAt: &past},
 	} {
-		if err := store.Create(ctx, l); err != nil {
+		if err := store.Create(context.Background(), l); err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	tests := []struct {
+		name         string
 		path         string
 		wantStatus   int
 		wantLocation string
 		wantCache    string
 	}{
-		{"/forever", http.StatusMovedPermanently, "https://example.com/forever", "private, max-age=90"},
-		{"/soon123", http.StatusMovedPermanently, "https://example.com/soon", "private, max-age=30"},
-		{"/missing", http.StatusNotFound, "", ""},
-		{"/expired", http.StatusGone, "", ""},
-		{"/deleted", http.StatusGone, "", ""},
+		{name: "permanent link", path: "/forever", wantStatus: http.StatusMovedPermanently, wantLocation: "https://example.com/forever", wantCache: "private, max-age=90"},
+		{name: "max-age capped by expiry", path: "/soon123", wantStatus: http.StatusMovedPermanently, wantLocation: "https://example.com/soon", wantCache: "private, max-age=30"},
+		{name: "missing", path: "/missing", wantStatus: http.StatusNotFound},
+		{name: "expired", path: "/expired", wantStatus: http.StatusGone},
+		{name: "deleted", path: "/deleted", wantStatus: http.StatusGone},
 	}
 	for _, tt := range tests {
-		t.Run(tt.path, func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
 			rec := do(h, http.MethodGet, tt.path, "")
 			if rec.Code != tt.wantStatus {
-				t.Fatalf("status = %d, want %d", rec.Code, tt.wantStatus)
+				t.Fatalf("GET %s: status = %d, want %d", tt.path, rec.Code, tt.wantStatus)
 			}
 			if got := rec.Header().Get("Location"); got != tt.wantLocation {
 				t.Errorf("Location = %q, want %q", got, tt.wantLocation)
@@ -175,22 +199,24 @@ func TestRedirect(t *testing.T) {
 	}
 }
 
-func TestCreateThenRedirect(t *testing.T) {
-	h, _ := newTestHandler(t)
-	rec := do(h, http.MethodPost, "/api/v1/links", `{"long_url":"https://example.com/x","alias":"mylink"}`)
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("create: status = %d", rec.Code)
+func TestRoutes(t *testing.T) {
+	tests := []struct {
+		name       string
+		method     string
+		path       string
+		wantStatus int
+	}{
+		{name: "health check", method: http.MethodGet, path: "/healthz", wantStatus: http.StatusOK},
+		{name: "root has no link", method: http.MethodGet, path: "/", wantStatus: http.StatusNotFound},
+		{name: "wrong method on links", method: http.MethodPut, path: "/api/v1/links", wantStatus: http.StatusMethodNotAllowed},
 	}
-	rec = do(h, http.MethodGet, "/mylink", "")
-	if rec.Code != http.StatusMovedPermanently || rec.Header().Get("Location") != "https://example.com/x" {
-		t.Errorf("redirect: status = %d, Location = %q", rec.Code, rec.Header().Get("Location"))
-	}
-}
-
-func TestHealthz(t *testing.T) {
-	h, _ := newTestHandler(t)
-	if rec := do(h, http.MethodGet, "/healthz", ""); rec.Code != http.StatusOK {
-		t.Errorf("status = %d, want 200", rec.Code)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h, _ := newTestHandler(t)
+			if rec := do(h, tt.method, tt.path, ""); rec.Code != tt.wantStatus {
+				t.Errorf("%s %s: status = %d, want %d", tt.method, tt.path, rec.Code, tt.wantStatus)
+			}
+		})
 	}
 }
 
@@ -202,16 +228,16 @@ func TestRedirectCacheAge(t *testing.T) {
 		expiresAt *time.Time
 		want      int
 	}{
-		{"no expiry", nil, 90},
-		{"expires later", at(time.Hour), 90},
-		{"expires sooner", at(10 * time.Second), 10},
-		{"sub-second", at(500 * time.Millisecond), 0},
-		{"already expired", at(-time.Second), 0},
+		{name: "no expiry", expiresAt: nil, want: 90},
+		{name: "expires later", expiresAt: at(time.Hour), want: 90},
+		{name: "expires sooner", expiresAt: at(10 * time.Second), want: 10},
+		{name: "sub-second", expiresAt: at(500 * time.Millisecond), want: 0},
+		{name: "already expired", expiresAt: at(-time.Second), want: 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := redirectCacheAge(link.Link{ExpiresAt: tt.expiresAt}, now); got != tt.want {
-				t.Errorf("got %d, want %d", got, tt.want)
+				t.Errorf("redirectCacheAge(expires %v) = %d, want %d", tt.expiresAt, got, tt.want)
 			}
 		})
 	}

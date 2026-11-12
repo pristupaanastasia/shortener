@@ -14,47 +14,64 @@ func TestAllow(t *testing.T) {
 	l := New(redis.NewClient(&redis.Options{Addr: mr.Addr()}))
 	now := time.Date(2026, 11, 12, 10, 0, 30, 0, time.UTC)
 	l.now = func() time.Time { return now }
-	ctx := context.Background()
+	resetAt := time.Date(2026, 11, 12, 10, 1, 0, 0, time.UTC)
 
-	for i := 1; i <= 3; i++ {
-		res, err := l.Allow(ctx, "ip:1.2.3.4", 3, time.Minute)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !res.Allowed || res.Remaining != 3-i {
-			t.Errorf("request %d: %+v, want allowed with %d remaining", i, res, 3-i)
-		}
-		if want := time.Date(2026, 11, 12, 10, 1, 0, 0, time.UTC); !res.Reset.Equal(want) {
-			t.Errorf("Reset = %v, want %v", res.Reset, want)
-		}
+	steps := []struct {
+		name          string
+		subject       string
+		advance       time.Duration // moves the clock before the request
+		wantAllowed   bool
+		wantRemaining int
+		wantReset     time.Time
+	}{
+		{name: "1st request", subject: "ip:1.2.3.4", wantAllowed: true, wantRemaining: 2, wantReset: resetAt},
+		{name: "2nd request", subject: "ip:1.2.3.4", wantAllowed: true, wantRemaining: 1, wantReset: resetAt},
+		{name: "3rd request uses the last slot", subject: "ip:1.2.3.4", wantAllowed: true, wantRemaining: 0, wantReset: resetAt},
+		{name: "4th request is denied", subject: "ip:1.2.3.4", wantAllowed: false, wantRemaining: 0, wantReset: resetAt},
+		{name: "another subject has its own quota", subject: "ip:5.6.7.8", wantAllowed: true, wantRemaining: 2, wantReset: resetAt},
+		{name: "next window starts fresh", subject: "ip:1.2.3.4", advance: time.Minute, wantAllowed: true, wantRemaining: 2, wantReset: resetAt.Add(time.Minute)},
 	}
-
-	res, _ := l.Allow(ctx, "ip:1.2.3.4", 3, time.Minute)
-	if res.Allowed || res.Remaining != 0 {
-		t.Errorf("4th request: %+v, want denied", res)
-	}
-
-	if res, _ := l.Allow(ctx, "ip:5.6.7.8", 3, time.Minute); !res.Allowed {
-		t.Error("another subject was limited")
-	}
-
-	now = now.Add(time.Minute)
-	if res, _ := l.Allow(ctx, "ip:1.2.3.4", 3, time.Minute); !res.Allowed || res.Remaining != 2 {
-		t.Errorf("next window: %+v, want a fresh quota", res)
+	for _, step := range steps {
+		ok := t.Run(step.name, func(t *testing.T) {
+			now = now.Add(step.advance)
+			res, err := l.Allow(context.Background(), step.subject, 3, time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.Allowed != step.wantAllowed || res.Remaining != step.wantRemaining || res.Limit != 3 || !res.Reset.Equal(step.wantReset) {
+				t.Fatalf("Allow(%s) = %+v, want allowed=%v remaining=%d reset=%v",
+					step.subject, res, step.wantAllowed, step.wantRemaining, step.wantReset)
+			}
+		})
+		if !ok {
+			break
+		}
 	}
 }
 
 func TestCountersExpire(t *testing.T) {
-	mr := miniredis.RunT(t)
-	l := New(redis.NewClient(&redis.Options{Addr: mr.Addr()}))
-	if _, err := l.Allow(context.Background(), "user:u1", 10, time.Minute); err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name    string
+		window  time.Duration
+		wantMax time.Duration
+	}{
+		{name: "one minute window", window: time.Minute, wantMax: time.Minute + time.Second},
+		{name: "one second window", window: time.Second, wantMax: 2 * time.Second},
 	}
-	keys := mr.Keys()
-	if len(keys) != 1 {
-		t.Fatalf("keys = %v", keys)
-	}
-	if ttl := mr.TTL(keys[0]); ttl <= 0 || ttl > time.Minute+time.Second {
-		t.Errorf("TTL = %v, want (0, 61s]", ttl)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mr := miniredis.RunT(t)
+			l := New(redis.NewClient(&redis.Options{Addr: mr.Addr()}))
+			if _, err := l.Allow(context.Background(), "user:u1", 10, tt.window); err != nil {
+				t.Fatal(err)
+			}
+			keys := mr.Keys()
+			if len(keys) != 1 {
+				t.Fatalf("keys = %v, want one counter", keys)
+			}
+			if ttl := mr.TTL(keys[0]); ttl <= 0 || ttl > tt.wantMax {
+				t.Errorf("TTL = %v, want (0, %v]", ttl, tt.wantMax)
+			}
+		})
 	}
 }

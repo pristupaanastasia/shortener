@@ -47,7 +47,7 @@ Each milestone produces a working service. Work in order; the user reviews each 
 
 ## Test Format Refactoring
 
-- [ ] Rewrite all existing tests in the table-driven format from the `go-table-tests` skill (cases in a slice, `for range` + `t.Run`; `steps` slices for stateful scenarios)
+- [x] Rewrite all existing tests in the table-driven format from the `go-table-tests` skill (cases in a slice, `for range` + `t.Run`; `steps` slices for stateful scenarios)
 
 **Done when:** every `Test...` function follows the skill; the set of checked behaviors is unchanged (no assertion is dropped); `make check` and `make test-integration` pass.
 
