@@ -1,14 +1,13 @@
 #!/bin/sh
-# Lint and test every commit being pushed. Enabled by `make hooks`.
-# Skip in an emergency: git push --no-verify
+# Lint, test and enforce the coverage minimum for every commit being pushed.
+# Enabled by `make hooks`. Skip in an emergency: git push --no-verify
 #
-# Each pushed commit is checked out into a temporary worktree, so the check
-# covers exactly what is pushed, not uncommitted changes in the working tree.
+# Each pushed commit is checked out into a temporary worktree, so the checks
+# cover exactly what is pushed, not uncommitted changes in the working tree.
 set -e
 root="$(git rev-parse --show-toplevel)"
 zero=0000000000000000000000000000000000000000
 
-# Integration tests need the Docker infrastructure; fall back to unit tests.
 infra_up=false
 if (cd "$root" && docker compose ps --status running --quiet 2>/dev/null | grep -q .); then
 	infra_up=true
@@ -19,21 +18,29 @@ while read -r local_ref local_sha remote_ref remote_sha; do
 
 	dir="$(mktemp -d)"
 	git worktree add --quiet --detach "$dir" "$local_sha"
+	short="$(git rev-parse --short "$local_sha")"
 
-	# Older commits may predate the test-integration target.
-	target=test
-	if $infra_up && make -C "$dir" -n test-integration >/dev/null 2>&1; then
-		target=test-integration
+	# Use the strongest check the commit's own Makefile provides: older commits
+	# predate the coverage and test-integration targets.
+	if make -C "$dir" -n coverage >/dev/null 2>&1; then
+		if ! $infra_up; then
+			git worktree remove --force "$dir"
+			echo "pre-push: $local_ref ($short) requires the coverage check, which runs integration tests."
+			echo "pre-push: start the infrastructure with \`make up\` and push again."
+			exit 1
+		fi
+		targets="lint coverage"
+	elif $infra_up && make -C "$dir" -n test-integration >/dev/null 2>&1; then
+		targets="lint test-integration"
+	else
+		targets="lint test"
 	fi
-	echo "pre-push: checking $local_ref ($(git rev-parse --short "$local_sha")): lint + $target"
-	if ! make -C "$dir" lint "$target"; then
+
+	echo "pre-push: checking $local_ref ($short): $targets"
+	if ! make -C "$dir" $targets; then
 		git worktree remove --force "$dir"
 		echo "pre-push: $local_ref failed the checks, push aborted"
 		exit 1
 	fi
 	git worktree remove --force "$dir"
 done
-
-if ! $infra_up; then
-	echo "pre-push: infrastructure is down, integration tests were skipped (run \`make up\` to include them)"
-fi
