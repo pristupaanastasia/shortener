@@ -11,20 +11,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/pristupaanastasia/shortener/internal/account"
+	"github.com/pristupaanastasia/shortener/internal/migrate"
+	"github.com/pristupaanastasia/shortener/migrations"
 )
-
-const schema = `
-CREATE TABLE IF NOT EXISTS users (
-	id         uuid PRIMARY KEY,
-	email      text NOT NULL UNIQUE,
-	created_at timestamptz NOT NULL
-);
-CREATE TABLE IF NOT EXISTS api_keys (
-	key_hash   bytea PRIMARY KEY,
-	user_id    uuid NOT NULL REFERENCES users (id),
-	created_at timestamptz NOT NULL,
-	revoked_at timestamptz
-);`
 
 // uniqueViolation is the PostgreSQL error code for a UNIQUE conflict.
 const uniqueViolation = "23505"
@@ -34,17 +23,75 @@ type Accounts struct {
 	pool *pgxpool.Pool
 }
 
-// Open connects to PostgreSQL and creates the tables if they do not exist.
+// Open connects to PostgreSQL and applies pending migrations.
 func Open(ctx context.Context, dsn string) (*Accounts, error) {
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("connect to postgres: %w", err)
 	}
-	if _, err := pool.Exec(ctx, schema); err != nil {
+	if err := applyMigrations(ctx, pool); err != nil {
 		pool.Close()
-		return nil, fmt.Errorf("migrate: %w", err)
+		return nil, err
 	}
 	return &Accounts{pool: pool}, nil
+}
+
+// migrationLock is the pg_advisory_lock key that serializes migrations when
+// several instances start at once.
+const migrationLock = 0x5f0e7e
+
+// applyMigrations runs the migrations from migrations/postgres that are not
+// recorded in schema_migrations, each in its own transaction together with
+// its schema_migrations row.
+func applyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
+	all, err := migrate.Load(migrations.Postgres, "postgres")
+	if err != nil {
+		return err
+	}
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	defer conn.Release()
+
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, migrationLock); err != nil {
+		return fmt.Errorf("migrate: lock: %w", err)
+	}
+	defer func() { _, _ = conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock($1)`, migrationLock) }()
+
+	_, err = conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
+		version int PRIMARY KEY, name text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())`)
+	if err != nil {
+		return fmt.Errorf("create schema_migrations: %w", err)
+	}
+	rows, err := conn.Query(ctx, `SELECT version FROM schema_migrations`)
+	if err != nil {
+		return fmt.Errorf("read schema_migrations: %w", err)
+	}
+	versions, err := pgx.CollectRows(rows, pgx.RowTo[int])
+	if err != nil {
+		return fmt.Errorf("read schema_migrations: %w", err)
+	}
+	applied := map[int]bool{}
+	for _, v := range versions {
+		applied[v] = true
+	}
+
+	for _, m := range migrate.Pending(all, applied) {
+		err := pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
+			for _, stmt := range m.Statements {
+				if _, err := tx.Exec(ctx, stmt); err != nil {
+					return err
+				}
+			}
+			_, err := tx.Exec(ctx, `INSERT INTO schema_migrations (version, name) VALUES ($1, $2)`, m.Version, m.Name)
+			return err
+		})
+		if err != nil {
+			return fmt.Errorf("migration %s: %w", m.Name, err)
+		}
+	}
+	return nil
 }
 
 // Close closes the connection pool.

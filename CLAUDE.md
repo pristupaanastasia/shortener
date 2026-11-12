@@ -21,12 +21,14 @@ URL shortener in Go, built as a learning project for system design and agentic d
 
 ```
 cmd/shortener/      main: config, wiring, graceful shutdown
+migrations/<db>/    versioned schema migrations, embedded and applied on startup
 internal/
   httpapi/          HTTP handlers, routing, middleware
   link/             domain: Link type, errors, Store interface, validation, service
   keygen/           key generation (salted hash + base62)
   storage/<impl>/   link.Store implementations (memory, cassandra, ...)
-  cache/            Redis and in-process caches (from M3)
+  cache/            Redis and in-process caches
+  migrate/          migration loader shared by the database runners
 ```
 
 New packages go under `internal/`. Keep `cmd/` thin.
@@ -38,6 +40,7 @@ New packages go under `internal/`. Keep `cmd/` thin.
 - Wrap errors with context: `fmt.Errorf("get link %q: %w", key, err)`. Use sentinel errors (`ErrNotFound`, `ErrAliasTaken`) for cases handlers map to HTTP codes.
 - Depend on interfaces at package boundaries, declared by the consumer (e.g. `link.Store`), so storage and caches can be swapped and faked in tests.
 - No global state; configuration comes from environment variables, parsed in `main`.
+- Database schemas live only in `migrations/<db>/`; never edit a committed migration, add a new one. Every database has integration tests for its migrations and queries (the `db-migrations` skill in `.claude/skills/` has the rules).
 - Tests: always table-driven, cases in a slice run with `for range` + `t.Run` (the `go-table-tests` skill in `.claude/skills/` has the exact format). `httptest` for handlers, an in-memory store for unit tests. Integration tests that need Docker use the `integration` build tag.
 
 ## Workflow

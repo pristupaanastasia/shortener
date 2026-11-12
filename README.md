@@ -373,6 +373,8 @@ Redis is used for what it does best: caching hot links, rate limiting counters a
 
 ### Schema
 
+The schema is defined by versioned migrations in `migrations/cassandra/` and `migrations/postgres/`, embedded into the binary and applied on startup (applied versions are recorded in a `schema_migrations` table). The CQL below is a summary of the current state.
+
 ```sql
 -- redirect, get, update, delete
 CREATE TABLE links (

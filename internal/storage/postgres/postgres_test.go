@@ -18,7 +18,7 @@ func openTestAccounts(t *testing.T) *Accounts {
 	t.Helper()
 	dsn := os.Getenv("POSTGRES_DSN")
 	if dsn == "" {
-		dsn = "postgres://shortener:shortener@127.0.0.1:5432/shortener?sslmode=disable"
+		dsn = testDSN()
 	}
 	a, err := Open(context.Background(), dsn)
 	if err != nil {
