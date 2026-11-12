@@ -240,3 +240,35 @@ func TestTopValues(t *testing.T) {
 		})
 	}
 }
+
+func TestLazyStats(t *testing.T) {
+	ctx := context.Background()
+	day := time.Date(2026, 11, 10, 0, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name       string
+		dsn        string
+		wantErr    bool
+		maxElapsed time.Duration
+	}{
+		{name: "reachable clickhouse connects at once", dsn: baseDSN()},
+		{name: "unreachable clickhouse fails fast", dsn: "clickhouse://shortener:shortener@127.0.0.1:1/shortener", wantErr: true, maxElapsed: 3 * time.Second},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			start := time.Now()
+			l := NewLazyStats(ctx, tt.dsn)
+			defer l.Close()
+			if tt.maxElapsed > 0 && time.Since(start) > tt.maxElapsed {
+				t.Errorf("NewLazyStats took %v, want < %v", time.Since(start), tt.maxElapsed)
+			}
+			if (l.Err() != nil) != tt.wantErr {
+				t.Fatalf("Err = %v, want error: %v", l.Err(), tt.wantErr)
+			}
+			_, err := l.Stats(ctx, "nothing", day, day)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Stats err = %v, want error: %v", err, tt.wantErr)
+			}
+		})
+	}
+}

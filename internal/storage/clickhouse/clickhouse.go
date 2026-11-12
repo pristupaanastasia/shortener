@@ -5,6 +5,7 @@ package clickhouse
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
@@ -30,6 +31,7 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse clickhouse dsn: %w", err)
 	}
+	opts.DialTimeout = 2 * time.Second
 	conn, err := clickhouse.Open(opts)
 	if err != nil {
 		return nil, fmt.Errorf("connect to clickhouse: %w", err)
@@ -175,4 +177,74 @@ func (s *Store) Stats(ctx context.Context, key string, from, to time.Time) (anal
 		st.LastClick = time.Time{} // max() of no rows is the epoch
 	}
 	return st, nil
+}
+
+// LazyStats connects on first use, so a service that only reads statistics
+// starts and keeps serving (redirects) while ClickHouse is down. Until a
+// connection succeeds, Stats returns an error (the API answers 503); failed
+// attempts are retried at most every retryInterval.
+type LazyStats struct {
+	dsn           string
+	retryInterval time.Duration
+
+	mu          sync.Mutex
+	store       *Store
+	lastAttempt time.Time
+	lastErr     error
+}
+
+// NewLazyStats returns a LazyStats for dsn and tries to connect once.
+func NewLazyStats(ctx context.Context, dsn string) *LazyStats {
+	l := &LazyStats{dsn: dsn, retryInterval: 10 * time.Second}
+	_, _ = l.get(ctx)
+	return l
+}
+
+// Err returns the last connection error, or nil when connected.
+func (l *LazyStats) Err() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.store != nil {
+		return nil
+	}
+	return l.lastErr
+}
+
+func (l *LazyStats) get(ctx context.Context) (*Store, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.store != nil {
+		return l.store, nil
+	}
+	if !l.lastAttempt.IsZero() && time.Since(l.lastAttempt) < l.retryInterval {
+		return nil, l.lastErr
+	}
+	l.lastAttempt = time.Now()
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	s, err := Open(ctx, l.dsn)
+	if err != nil {
+		l.lastErr = err
+		return nil, err
+	}
+	l.store = s
+	return s, nil
+}
+
+// Stats implements analytics.StatsReader.
+func (l *LazyStats) Stats(ctx context.Context, key string, from, to time.Time) (analytics.Stats, error) {
+	s, err := l.get(ctx)
+	if err != nil {
+		return analytics.Stats{}, err
+	}
+	return s.Stats(ctx, key, from, to)
+}
+
+// Close closes the connection, if any.
+func (l *LazyStats) Close() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.store != nil {
+		l.store.Close()
+	}
 }

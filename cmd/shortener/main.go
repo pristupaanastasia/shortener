@@ -164,9 +164,11 @@ func run(logger *slog.Logger) error {
 		api.CountryHeader = cfg.countryHeader
 	}
 	if cfg.clickhouseDSN != "" {
-		stats, err := clickhouse.Open(ctx, cfg.clickhouseDSN)
-		if err != nil {
-			return err
+		// Statistics are optional for this service: an unreachable ClickHouse
+		// must not stop redirects. /stats answers 503 until it connects.
+		stats := clickhouse.NewLazyStats(ctx, cfg.clickhouseDSN)
+		if err := stats.Err(); err != nil {
+			logger.Warn("clickhouse unavailable, /stats returns 503 until it recovers", "err", err)
 		}
 		defer stats.Close()
 		api.Stats = stats
