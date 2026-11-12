@@ -9,6 +9,11 @@ import "embed"
 //go:embed cassandra/*.cql
 var Cassandra embed.FS
 
+// ClickHouse holds clickhouse/NNNN_name.sql files.
+//
+//go:embed clickhouse/*.sql
+var ClickHouse embed.FS
+
 // Postgres holds postgres/NNNN_name.sql files.
 //
 //go:embed postgres/*.sql

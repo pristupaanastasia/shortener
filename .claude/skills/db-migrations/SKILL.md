@@ -16,6 +16,7 @@ migrations/
   cassandra/0002_create_links_by_user.cql
   postgres/0001_create_users.sql
   postgres/0002_create_api_keys.sql
+  clickhouse/0001_create_clicks.sql
 ```
 
 - One directory per database, one `embed.FS` variable per directory in `migrations/migrations.go`.
@@ -40,6 +41,11 @@ migrations/
 - DDL is not transactional: a migration interrupted halfway is re-run from the start. **Every statement must be idempotent**: `CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`, `ALTER TABLE ... ADD` only for columns that cannot exist yet.
 - The keyspace itself is created in code, because its replication factor depends on the deployment. Everything inside the keyspace comes from migrations.
 - Design tables per query (query-first modeling); a new query usually means a new table, not a new index.
+
+**ClickHouse** (`internal/storage/clickhouse`):
+- DDL is not transactional either: every statement must be idempotent (`IF NOT EXISTS`).
+- A materialized view only processes rows inserted after it is created. A migration that adds a view over existing data must backfill it explicitly (`INSERT INTO target SELECT ... FROM source`), and say so in a comment.
+- `SummingMergeTree` collapses rows only during background merges: queries must aggregate (`sum(clicks)`), never read rows as final.
 
 ## A new database
 
