@@ -1,4 +1,4 @@
-.PHONY: build run test test-integration lint check up down
+.PHONY: build run test test-integration lint check up down hooks
 
 build:
 	go build -o bin/shortener ./cmd/shortener
@@ -27,3 +27,7 @@ up:
 
 down:
 	docker compose down
+
+# Use the versioned git hooks from .githooks (pre-push: lint + tests).
+hooks:
+	git config core.hooksPath .githooks

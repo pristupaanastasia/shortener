@@ -1,0 +1,39 @@
+#!/bin/sh
+# Lint and test every commit being pushed. Enabled by `make hooks`.
+# Skip in an emergency: git push --no-verify
+#
+# Each pushed commit is checked out into a temporary worktree, so the check
+# covers exactly what is pushed, not uncommitted changes in the working tree.
+set -e
+root="$(git rev-parse --show-toplevel)"
+zero=0000000000000000000000000000000000000000
+
+# Integration tests need the Docker infrastructure; fall back to unit tests.
+infra_up=false
+if (cd "$root" && docker compose ps --status running --quiet 2>/dev/null | grep -q .); then
+	infra_up=true
+fi
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+	[ "$local_sha" = "$zero" ] && continue # deleting a remote branch
+
+	dir="$(mktemp -d)"
+	git worktree add --quiet --detach "$dir" "$local_sha"
+
+	# Older commits may predate the test-integration target.
+	target=test
+	if $infra_up && make -C "$dir" -n test-integration >/dev/null 2>&1; then
+		target=test-integration
+	fi
+	echo "pre-push: checking $local_ref ($(git rev-parse --short "$local_sha")): lint + $target"
+	if ! make -C "$dir" lint "$target"; then
+		git worktree remove --force "$dir"
+		echo "pre-push: $local_ref failed the checks, push aborted"
+		exit 1
+	fi
+	git worktree remove --force "$dir"
+done
+
+if ! $infra_up; then
+	echo "pre-push: infrastructure is down, integration tests were skipped (run \`make up\` to include them)"
+fi
