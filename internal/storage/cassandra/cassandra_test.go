@@ -327,6 +327,8 @@ func TestListByUserErrors(t *testing.T) {
 		wantErr error
 	}{
 		{name: "cursor not base64", user: gocql.MustRandomUUID().String(), cursor: "!!!not-base64", wantErr: link.ErrInvalidCursor},
+		{name: "base64 cursor that is not a paging state", user: gocql.MustRandomUUID().String(), cursor: "AAAA", wantErr: link.ErrInvalidCursor},
+		{name: "base64 text as a cursor", user: gocql.MustRandomUUID().String(), cursor: "bm90LWpzb24", wantErr: link.ErrInvalidCursor},
 		{name: "user id not a uuid", user: "not-a-uuid", wantErr: link.ErrNotFound},
 	}
 	for _, tt := range tests {

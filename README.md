@@ -281,7 +281,7 @@ Authorization: Bearer <api_key>
 }
 ```
 
-Cursor pagination instead of offset: `OFFSET N` makes the database scan and discard N rows and shifts when new links are inserted. A cursor (encoded `created_at + key` of the last item) becomes `WHERE (created_at, key) < (...) LIMIT 50`, which is fast at any depth and stable.
+Cursor pagination instead of offset: `OFFSET N` makes the database scan and discard N rows and shifts when new links are inserted. A cursor marks the position after the last item, so each page is a range read that is fast at any depth and stable. The cursor is opaque: the Cassandra store uses Cassandra's own paging state (base64-encoded), the in-memory store encodes `created_at + key`. An invalid cursor returns `400 invalid_cursor`.
 
 #### Update a link
 
@@ -501,14 +501,14 @@ All services are **stateless**: state lives only in the storage layer, so servic
 ### Flow 2: Create a link
 
 1. **Load Balancer → API Gateway:**
-   - API key check (PostgreSQL, cached in Redis);
+   - API key check: PostgreSQL, with valid keys cached in memory for 1 minute (revoking a key takes effect within a minute). A key that is not cached is first counted against the per-IP rate limit, so guessing keys costs no database queries once the client is limited;
    - rate limit: `INCR` a counter in Redis, return 429 when exceeded;
    - if `Idempotency-Key` is present: `SET NX` in Redis; if the key already exists, return the stored response.
 2. **Link Service:**
    - URL validation: `http`/`https` scheme, length, not pointing to our own domain (prevents redirect loops);
    - **with alias:** `INSERT ... IF NOT EXISTS` (LWT); 409 if the row already exists;
    - **without alias:** generate a key and insert it with `IF NOT EXISTS`; on collision, retry with a new key.
-3. **Cassandra:** insert into `links` with `IF NOT EXISTS` (this is what guarantees key uniqueness), then, for links with an owner, a plain insert into `links_by_user`. Both with consistency `QUORUM` (2 of 3 replicas) to guarantee durability. They cannot be combined into one batch: Cassandra rejects conditional batches that span tables.
+3. **Cassandra:** insert into `links` with `IF NOT EXISTS` (this is what guarantees key uniqueness), then, for links with an owner, a plain insert into `links_by_user` (retried up to 3 times: once `links` is written, the key is taken, so a failed listing write could not be repaired by retrying the request; if all attempts fail, the link works but is missing from the owner's listing). Both with consistency `QUORUM` (2 of 3 replicas) to guarantee durability. They cannot be combined into one batch: Cassandra rejects conditional batches that span tables.
 4. Respond **201**.
 
 The cache is **not warmed** on creation: most links never become hot, and the first click populates the cache.

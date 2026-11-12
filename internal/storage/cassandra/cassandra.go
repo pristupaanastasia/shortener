@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -176,14 +177,25 @@ func (s *Store) Create(ctx context.Context, l link.Link) error {
 	if userID == nil {
 		return nil
 	}
-	err = s.session.Query(s.insertLinkByUser,
-		userID, l.CreatedAt, l.Key, l.LongURL, l.ExpiresAt,
-	).ExecContext(ctx)
-	if err != nil {
-		return fmt.Errorf("insert link %q into links_by_user: %w", l.Key, err)
+	// The link is stored at this point; a failure here would leave it out of
+	// its owner's listing, and a retry of the request could not repair it
+	// (the key is now taken). The insert is idempotent, so retry it.
+	for attempt := 1; ; attempt++ {
+		err = s.session.Query(s.insertLinkByUser,
+			userID, l.CreatedAt, l.Key, l.LongURL, l.ExpiresAt,
+		).ExecContext(ctx)
+		if err == nil {
+			return nil
+		}
+		if attempt == listingWriteAttempts || ctx.Err() != nil {
+			return fmt.Errorf("insert link %q into links_by_user: %w", l.Key, err)
+		}
+		time.Sleep(time.Duration(attempt) * 50 * time.Millisecond)
 	}
-	return nil
 }
+
+// listingWriteAttempts bounds retries of the links_by_user insert in Create.
+const listingWriteAttempts = 3
 
 // Get implements link.Store.
 func (s *Store) Get(ctx context.Context, key string) (link.Link, error) {
@@ -294,6 +306,11 @@ func (s *Store) ListByUser(ctx context.Context, userID, cursor string, limit int
 	}
 	next := iter.PageState()
 	if err := iter.Close(); err != nil {
+		// The cursor comes from the client: a paging state Cassandra cannot
+		// parse is a bad request, not a server error.
+		if cursor != "" && isRequestError(err, gocql.ErrCodeProtocol, gocql.ErrCodeInvalid) {
+			return nil, "", link.ErrInvalidCursor
+		}
 		return nil, "", fmt.Errorf("list links of user %q: %w", userID, err)
 	}
 
@@ -303,6 +320,11 @@ func (s *Store) ListByUser(ctx context.Context, userID, cursor string, limit int
 		return links, "", nil
 	}
 	return links, base64.RawURLEncoding.EncodeToString(next), nil
+}
+
+func isRequestError(err error, codes ...int) bool {
+	reqErr, ok := errors.AsType[gocql.RequestError](err)
+	return ok && slices.Contains(codes, reqErr.Code())
 }
 
 // parseUserID returns nil for anonymous links (empty id).
