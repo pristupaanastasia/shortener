@@ -8,7 +8,13 @@ profile="${COVERAGE_PROFILE:-coverage.out}"
 
 # -coverpkg counts statements covered by tests of any package (e.g. the
 # memory store exercised by HTTP tests), not only the package's own tests.
-go test -race -count=1 -tags integration -coverpkg=./... -coverprofile="$profile" ./... > /dev/null
+# The output is kept quiet on success but shown in full on failure: without
+# it, CI would report only "Error 1" with no failing test name.
+if ! out="$(go test -race -count=1 -tags integration -coverpkg=./... -coverprofile="$profile" ./... 2>&1)"; then
+	echo "$out"
+	echo "coverage: tests failed"
+	exit 1
+fi
 
 total="$(go tool cover -func="$profile" | awk '/^total:/ { sub(/%/, "", $NF); print $NF }')"
 echo "coverage: total ${total}% (minimum ${min}%)"
