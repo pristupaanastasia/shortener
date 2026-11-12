@@ -176,6 +176,7 @@ func run(logger *slog.Logger) error {
 		Addr:              cfg.addr,
 		Handler:           httpapi.New(api),
 		ReadHeaderTimeout: 5 * time.Second,
+		MaxHeaderBytes:    64 << 10,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       60 * time.Second,

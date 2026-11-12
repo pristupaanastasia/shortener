@@ -69,7 +69,12 @@ func TestRedirectPublishesClicks(t *testing.T) {
 		{
 			name: "redirect publishes a click", path: "/abc1234",
 			headers:   map[string]string{"User-Agent": "curl/8.7.1", "Referer": "https://news.example/x"},
-			wantClick: &analytics.Click{Key: "abc1234", Time: statsNow, UserAgent: "curl/8.7.1", Referrer: "https://news.example/x"},
+			wantClick: &analytics.Click{Key: "abc1234", Time: statsNow, UserAgent: "curl/8.7.1", Referrer: "news.example"},
+		},
+		{
+			name: "huge headers are cut down", path: "/abc1234",
+			headers:   map[string]string{"User-Agent": strings.Repeat("u", 4000), "Referer": "https://ref.example/" + strings.Repeat("p", 4000)},
+			wantClick: &analytics.Click{Key: "abc1234", Time: statsNow, UserAgent: strings.Repeat("u", analytics.MaxUserAgent), Referrer: "ref.example"},
 		},
 		{
 			name: "country from the configured header", countryHeader: "CF-IPCountry", path: "/abc1234",

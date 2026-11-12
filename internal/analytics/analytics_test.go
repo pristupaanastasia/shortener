@@ -3,6 +3,7 @@ package analytics
 import (
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 )
@@ -89,6 +90,11 @@ func TestDecode(t *testing.T) {
 			data: `{"key":"abc1234","ts":"2026-11-12T10:00:00Z"}`,
 			want: Row{Key: "abc1234", Time: ts, Country: "unknown", Device: "unknown", Referrer: "direct"},
 		},
+		{
+			name: "referrer as a host",
+			data: `{"key":"abc1234","ts":"2026-11-12T10:00:00Z","ref":"News.Example"}`,
+			want: Row{Key: "abc1234", Time: ts, Country: "unknown", Device: "unknown", Referrer: "news.example"},
+		},
 		{name: "not json", data: `not json`, wantErr: true},
 		{name: "missing key", data: `{"ts":"2026-11-12T10:00:00Z"}`, wantErr: true},
 		{name: "missing time", data: `{"key":"abc1234"}`, wantErr: true},
@@ -138,6 +144,29 @@ func TestPublishDoesNotBlock(t *testing.T) {
 			}
 			if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
 				t.Errorf("%d publishes took %v with Kafka down, want < 100ms", tt.events, elapsed)
+			}
+		})
+	}
+}
+
+func TestNewClick(t *testing.T) {
+	ts := time.Date(2026, 11, 12, 10, 0, 0, 0, time.UTC)
+	long := strings.Repeat("a", MaxUserAgent+100)
+	tests := []struct {
+		name                  string
+		country, ua, referrer string
+		want                  Click
+	}{
+		{name: "full request", country: "de", ua: "curl/8.7.1", referrer: "https://www.News.example/path?token=secret",
+			want: Click{Key: "k", Time: ts, Country: "DE", UserAgent: "curl/8.7.1", Referrer: "news.example"}},
+		{name: "nothing known", want: Click{Key: "k", Time: ts}},
+		{name: "long user agent is truncated", ua: long, want: Click{Key: "k", Time: ts, UserAgent: long[:MaxUserAgent]}},
+		{name: "invalid country is dropped", country: "Germany", want: Click{Key: "k", Time: ts}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := NewClick("k", ts, tt.country, tt.ua, tt.referrer); got != tt.want {
+				t.Errorf("NewClick = %+v, want %+v", got, tt.want)
 			}
 		})
 	}

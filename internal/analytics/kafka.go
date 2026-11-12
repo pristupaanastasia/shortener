@@ -32,8 +32,10 @@ func NewKafkaPublisher(brokers []string, logger *slog.Logger) (*KafkaPublisher, 
 		// Records wait in memory and are sent in batches.
 		kgo.ProducerLinger(50*time.Millisecond),
 		// A bounded buffer: when Kafka is down and it fills up, new clicks
-		// are dropped instead of growing memory without limit.
+		// are dropped instead of growing memory without limit. Both limits
+		// matter: the record count alone allows huge records.
 		kgo.MaxBufferedRecords(100_000),
+		kgo.MaxBufferedBytes(64<<20),
 		kgo.RecordDeliveryTimeout(30*time.Second),
 	)
 	if err != nil {

@@ -310,16 +310,11 @@ func (h *Handler) redirect(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusMovedPermanently)
 
 	if h.clicks != nil {
-		c := analytics.Click{
-			Key:       l.Key,
-			Time:      h.now(),
-			UserAgent: r.UserAgent(),
-			Referrer:  r.Referer(),
-		}
+		var country string
 		if h.countryHeader != "" {
-			c.Country = analytics.Country(r.Header.Get(h.countryHeader))
+			country = r.Header.Get(h.countryHeader)
 		}
-		h.clicks.Publish(c) // never blocks
+		h.clicks.Publish(analytics.NewClick(l.Key, h.now(), country, r.UserAgent(), r.Referer())) // never blocks
 	}
 }
 

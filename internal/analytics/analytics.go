@@ -21,8 +21,26 @@ type Click struct {
 	Key       string    `json:"key"`
 	Time      time.Time `json:"ts"`
 	Country   string    `json:"country,omitempty"` // ISO 3166-1 alpha-2, "" if unknown
-	UserAgent string    `json:"ua,omitempty"`
-	Referrer  string    `json:"ref,omitempty"`
+	UserAgent string    `json:"ua,omitempty"`      // at most MaxUserAgent bytes
+	Referrer  string    `json:"ref,omitempty"`     // host of the referring page
+}
+
+// MaxUserAgent caps the User-Agent kept in an event: device detection needs
+// only the start, and events stay small while buffered.
+const MaxUserAgent = 512
+
+// NewClick builds an event from request data. Only the host of the referrer
+// is kept: paths and queries may contain personal data, and a full URL can be
+// large.
+func NewClick(key string, t time.Time, country, userAgent, referrer string) Click {
+	if len(userAgent) > MaxUserAgent {
+		userAgent = userAgent[:MaxUserAgent]
+	}
+	c := Click{Key: key, Time: t, Country: Country(country), UserAgent: userAgent}
+	if host := ReferrerHost(referrer); host != "direct" {
+		c.Referrer = host
+	}
+	return c
 }
 
 // Publisher sends click events. Publish never blocks and never fails the
@@ -84,8 +102,21 @@ func Decode(data []byte) (Row, error) {
 		Time:     c.Time.UTC(),
 		Country:  orUnknown(Country(c.Country)),
 		Device:   Device(c.UserAgent),
-		Referrer: ReferrerHost(c.Referrer),
+		Referrer: referrerValue(c.Referrer),
 	}, nil
+}
+
+// referrerValue accepts a host (current events) or a full URL (events
+// published before only the host was sent).
+func referrerValue(ref string) string {
+	switch {
+	case ref == "":
+		return "direct"
+	case strings.Contains(ref, "://"):
+		return ReferrerHost(ref)
+	default:
+		return strings.ToLower(ref)
+	}
 }
 
 var countryPattern = regexp.MustCompile(`^[A-Z]{2}$`)
