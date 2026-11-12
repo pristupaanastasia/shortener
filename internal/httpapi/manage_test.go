@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -8,7 +9,9 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
@@ -21,22 +24,26 @@ import (
 )
 
 // newFullHandler returns a handler with rate limiting and idempotency backed
-// by an in-process Redis.
+// by an in-process Redis. The limiter's clock is fixed in the middle of a
+// window, so a test never straddles a window boundary.
 func newFullHandler(t *testing.T, anonymousLimit int) *Handler {
 	t.Helper()
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
-	return New(Config{
+	fixed := time.Date(2026, 11, 12, 10, 0, 30, 0, time.UTC)
+	h := New(Config{
 		Links:          link.NewService(memory.New(), "sho.rt"),
 		Accounts:       account.NewService(memory.NewAccounts()),
-		Limiter:        ratelimit.New(rdb),
+		Limiter:        ratelimit.New(rdb, ratelimit.WithClock(func() time.Time { return fixed })),
 		Idempotency:    idempotency.New(rdb, idempotency.DefaultTTL),
 		BaseURL:        "https://sho.rt",
 		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 		AnonymousLimit: anonymousLimit,
 		UserLimit:      1000,
 	})
+	h.now = func() time.Time { return fixed } // for Retry-After
+	return h
 }
 
 type request struct {
@@ -451,4 +458,126 @@ func TestIdempotency(t *testing.T) {
 		{name: "client error is stored", req: static(bad), wantStatus: http.StatusBadRequest, check: replayed(false)},
 		{name: "client error is replayed", req: static(bad), wantStatus: http.StatusBadRequest, check: replayed(true)},
 	})
+}
+
+// cancelingStore cancels the request context right after a successful create,
+// like a client that times out and disconnects while the link is being stored.
+type cancelingStore struct {
+	*memory.Store
+	cancel context.CancelFunc
+}
+
+func (s *cancelingStore) Create(ctx context.Context, l link.Link) error {
+	err := s.Store.Create(ctx, l)
+	s.cancel()
+	return err
+}
+
+// Regression: the response was stored with the request context, so after a
+// disconnect the key stayed "in progress" and every retry got 409 for 24h.
+func TestIdempotencyAfterClientDisconnect(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	store := &cancelingStore{Store: memory.New()}
+	h := New(Config{
+		Links:       link.NewService(store, "sho.rt"),
+		Accounts:    account.NewService(memory.NewAccounts()),
+		Limiter:     ratelimit.New(rdb),
+		Idempotency: idempotency.New(rdb, idempotency.DefaultTTL),
+		BaseURL:     "https://sho.rt",
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+
+	tests := []struct {
+		name         string
+		disconnect   bool
+		wantStatus   int
+		wantReplayed bool
+	}{
+		{name: "client disconnects after the link is stored", disconnect: true, wantStatus: http.StatusCreated},
+		{name: "retry gets the original response", wantStatus: http.StatusCreated, wantReplayed: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			store.cancel = func() {}
+			if tt.disconnect {
+				store.cancel = cancel
+			}
+			req := httptest.NewRequestWithContext(ctx, "POST", "/api/v1/links", strings.NewReader(`{"long_url":"https://example.com"}`))
+			req.Header.Set("Idempotency-Key", "disconnect-1")
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d; body: %s", rec.Code, tt.wantStatus, rec.Body)
+			}
+			if got := rec.Header().Get("Idempotent-Replayed") == "true"; got != tt.wantReplayed {
+				t.Errorf("Idempotent-Replayed = %v, want %v", got, tt.wantReplayed)
+			}
+		})
+	}
+}
+
+// countingAccounts counts database lookups of API keys.
+type countingAccounts struct {
+	*memory.Accounts
+	lookups atomic.Int32
+}
+
+func (a *countingAccounts) UserByKeyHash(ctx context.Context, hash []byte) (account.User, error) {
+	a.lookups.Add(1)
+	return a.Accounts.UserByKeyHash(ctx, hash)
+}
+
+// Regression: every request looked the key up in the database, even guesses
+// that were already rate limited.
+func TestKeyLookups(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	accounts := &countingAccounts{Accounts: memory.NewAccounts()}
+	fixed := time.Date(2026, 11, 12, 10, 0, 30, 0, time.UTC)
+	h := New(Config{
+		Links:          link.NewService(memory.New(), "sho.rt"),
+		Accounts:       account.NewService(accounts),
+		Limiter:        ratelimit.New(rdb, ratelimit.WithClock(func() time.Time { return fixed })),
+		BaseURL:        "https://sho.rt",
+		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		AnonymousLimit: 2,
+		UserLimit:      100,
+	})
+	key := registerUser(t, h, "alice@example.com")
+	list := func(apiKey, ip string) request {
+		return request{method: "GET", path: "/api/v1/links", apiKey: apiKey, remoteAddr: ip + ":5000"}
+	}
+
+	steps := []struct {
+		name        string
+		req         request
+		wantStatus  int
+		wantLookups int32 // total so far
+	}{
+		{name: "valid key is looked up once", req: list(key, "198.51.100.1"), wantStatus: http.StatusOK, wantLookups: 1},
+		{name: "then served from the cache", req: list(key, "198.51.100.1"), wantStatus: http.StatusOK, wantLookups: 1},
+		{name: "cached key is not limited by the ip quota", req: list(key, "198.51.100.1"), wantStatus: http.StatusOK, wantLookups: 1},
+		{name: "1st guess is looked up", req: list("sk_guess1", "203.0.113.7"), wantStatus: http.StatusUnauthorized, wantLookups: 2},
+		{name: "2nd guess is looked up", req: list("sk_guess2", "203.0.113.7"), wantStatus: http.StatusUnauthorized, wantLookups: 3},
+		{name: "rate limited guess costs no lookup", req: list("sk_guess3", "203.0.113.7"), wantStatus: http.StatusTooManyRequests, wantLookups: 3},
+		{name: "another rate limited guess costs no lookup", req: list("sk_guess4", "203.0.113.7"), wantStatus: http.StatusTooManyRequests, wantLookups: 3},
+	}
+	for _, step := range steps {
+		ok := t.Run(step.name, func(t *testing.T) {
+			if rec := send(h, step.req); rec.Code != step.wantStatus {
+				t.Fatalf("status = %d, want %d; body: %s", rec.Code, step.wantStatus, rec.Body)
+			}
+			if got := accounts.lookups.Load(); got != step.wantLookups {
+				t.Errorf("database lookups = %d, want %d", got, step.wantLookups)
+			}
+		})
+		if !ok {
+			break
+		}
+	}
 }

@@ -3,6 +3,7 @@ package idempotency
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
@@ -30,8 +31,8 @@ func TestLifecycle(t *testing.T) {
 		{name: "first request claims the key", wantStarted: true, action: func() (Record, bool, error) {
 			return s.Begin(ctx, "user:1", "k1", "fp1")
 		}, check: func(t *testing.T) {
-			if ttl := mr.TTL(redisKey("user:1", "k1")); ttl <= 0 || ttl > DefaultTTL {
-				t.Errorf("TTL = %v, want (0, %v]", ttl, DefaultTTL)
+			if ttl := mr.TTL(redisKey("user:1", "k1")); ttl <= 0 || ttl > PendingTTL {
+				t.Errorf("pending TTL = %v, want (0, %v]", ttl, PendingTTL)
 			}
 		}},
 		{name: "retry while running sees pending", wantRecord: Record{Fingerprint: "fp1", Pending: true}, action: func() (Record, bool, error) {
@@ -42,6 +43,17 @@ func TestLifecycle(t *testing.T) {
 				return Record{}, false, err
 			}
 			return s.Begin(ctx, "user:1", "k1", "fp1")
+		}, check: func(t *testing.T) {
+			if ttl := mr.TTL(redisKey("user:1", "k1")); ttl <= PendingTTL {
+				t.Errorf("stored response TTL = %v, want the full %v", ttl, DefaultTTL)
+			}
+		}},
+		{name: "a stuck pending key frees itself", wantStarted: true, action: func() (Record, bool, error) {
+			if _, _, err := s.Begin(ctx, "user:3", "k1", "fp1"); err != nil {
+				return Record{}, false, err
+			}
+			mr.FastForward(PendingTTL + time.Second) // the first request never completed
+			return s.Begin(ctx, "user:3", "k1", "fp1")
 		}},
 		{name: "same key in another scope is free", wantStarted: true, action: func() (Record, bool, error) {
 			return s.Begin(ctx, "user:2", "k1", "fp1")

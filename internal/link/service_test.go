@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -27,11 +29,30 @@ func (m mapStore) Get(_ context.Context, key string) (Link, error) {
 	return l, nil
 }
 
-func (m mapStore) Update(_ context.Context, l Link) error {
-	if _, ok := m[l.Key]; !ok {
+func (m mapStore) Update(_ context.Context, l Link, f Fields) error {
+	cur, ok := m[l.Key]
+	if !ok || cur.DeletedAt != nil {
 		return ErrNotFound
 	}
-	m[l.Key] = l
+	if f.LongURL {
+		cur.LongURL = l.LongURL
+	}
+	if f.ExpiresAt {
+		cur.ExpiresAt = l.ExpiresAt
+	}
+	m[l.Key] = cur
+	return nil
+}
+
+func (m mapStore) Delete(_ context.Context, l Link) error {
+	cur, ok := m[l.Key]
+	if !ok {
+		return ErrNotFound
+	}
+	if cur.DeletedAt == nil {
+		cur.DeletedAt = l.DeletedAt
+		m[l.Key] = cur
+	}
 	return nil
 }
 
@@ -64,6 +85,10 @@ func TestCreateValidation(t *testing.T) {
 		{"javascript scheme", CreateParams{LongURL: "javascript:alert(1)"}, ErrInvalidURL},
 		{"too long", CreateParams{LongURL: "https://example.com/" + strings.Repeat("a", maxURLLength)}, ErrInvalidURL},
 		{"own host", CreateParams{LongURL: "https://SHO.RT/abc1234"}, ErrInvalidURL},
+		{"own host with default port", CreateParams{LongURL: "https://sho.rt:443/abc1234"}, ErrInvalidURL},
+		{"own host with trailing dot", CreateParams{LongURL: "https://sho.rt./abc1234"}, ErrInvalidURL},
+		{"own host with another port", CreateParams{LongURL: "http://sho.rt:8080/abc1234"}, ErrInvalidURL},
+		{"subdomain is another host", CreateParams{LongURL: "https://api.sho.rt/abc1234"}, nil},
 		{"alias too short", CreateParams{LongURL: "https://example.com", Alias: "abc"}, ErrInvalidAlias},
 		{"alias too long", CreateParams{LongURL: "https://example.com", Alias: strings.Repeat("a", 31)}, ErrInvalidAlias},
 		{"alias bad chars", CreateParams{LongURL: "https://example.com", Alias: "sale/2026"}, ErrInvalidAlias},
@@ -132,7 +157,7 @@ func TestCreateKeyCollisions(t *testing.T) {
 			}
 			s := newTestService(store)
 			attempts := 0
-			s.generate = func(_ string, _ time.Time, attempt int) string {
+			s.generate = func(_ string, attempt int) string {
 				attempts++
 				return tt.candidates[min(attempt, len(tt.candidates)-1)]
 			}
@@ -300,5 +325,135 @@ func TestDelete(t *testing.T) {
 		if !ok {
 			break
 		}
+	}
+}
+
+// Regression: keys used to be salted with a millisecond timestamp, so
+// concurrent creates of one URL collided on every attempt.
+func TestCreateConcurrentSameURL(t *testing.T) {
+	tests := []struct {
+		name       string
+		goroutines int
+	}{
+		{name: "200 concurrent creates of one url", goroutines: 200},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := NewService(&lockedStore{m: mapStore{}}, "sho.rt")
+			var wg sync.WaitGroup
+			var failed atomic.Int32
+			for range tt.goroutines {
+				wg.Go(func() {
+					if _, err := s.Create(context.Background(), CreateParams{LongURL: "https://example.com/popular"}); err != nil {
+						failed.Add(1)
+					}
+				})
+			}
+			wg.Wait()
+			if n := failed.Load(); n != 0 {
+				t.Errorf("%d of %d creates failed", n, tt.goroutines)
+			}
+		})
+	}
+}
+
+// lockedStore makes mapStore safe for concurrent use.
+type lockedStore struct {
+	mu sync.Mutex
+	m  mapStore
+}
+
+func (s *lockedStore) Create(ctx context.Context, l Link) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.m.Create(ctx, l)
+}
+
+func (s *lockedStore) Get(ctx context.Context, key string) (Link, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.m.Get(ctx, key)
+}
+
+func (s *lockedStore) Update(ctx context.Context, l Link, f Fields) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.m.Update(ctx, l, f)
+}
+
+func (s *lockedStore) Delete(ctx context.Context, l Link) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.m.Delete(ctx, l)
+}
+
+func (s *lockedStore) ListByUser(ctx context.Context, userID, cursor string, limit int) ([]Link, string, error) {
+	return nil, "", nil
+}
+
+// staleStore serves Get from a snapshot taken before later writes, like an
+// instance whose cache has not been invalidated yet.
+type staleStore struct {
+	mapStore
+	snapshot map[string]Link
+}
+
+func (s staleStore) Get(_ context.Context, key string) (Link, error) {
+	l, ok := s.snapshot[key]
+	if !ok {
+		return Link{}, ErrNotFound
+	}
+	return l, nil
+}
+
+// Regression: an update based on a stale read wrote every column back,
+// undeleting the link and reverting concurrent changes.
+func TestUpdateWithStaleRead(t *testing.T) {
+	newURL := "https://example.com/new"
+	expires := testNow.Add(time.Hour)
+
+	tests := []struct {
+		name        string
+		change      func(m mapStore) // applied after the stale snapshot
+		params      UpdateParams
+		wantErr     error
+		wantURL     string
+		wantExpires bool
+		wantDeleted bool
+	}{
+		{
+			name:        "deleted elsewhere stays deleted",
+			change:      func(m mapStore) { l := m["alice01"]; l.DeletedAt = ptr(testNow); m["alice01"] = l },
+			params:      UpdateParams{LongURL: &newURL},
+			wantErr:     ErrNotFound,
+			wantURL:     "https://example.com/a",
+			wantDeleted: true,
+		},
+		{
+			name:        "expiry set elsewhere survives a url change",
+			change:      func(m mapStore) { l := m["alice01"]; l.ExpiresAt = &expires; m["alice01"] = l },
+			params:      UpdateParams{LongURL: &newURL},
+			wantURL:     newURL,
+			wantExpires: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := ownershipStore()
+			snapshot := map[string]Link{}
+			for k, v := range m {
+				snapshot[k] = v
+			}
+			tt.change(m)
+
+			_, err := newTestService(staleStore{mapStore: m, snapshot: snapshot}).Update(context.Background(), alice, "alice01", tt.params)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("Update err = %v, want %v", err, tt.wantErr)
+			}
+			got := m["alice01"]
+			if got.LongURL != tt.wantURL || (got.ExpiresAt != nil) != tt.wantExpires || (got.DeletedAt != nil) != tt.wantDeleted {
+				t.Errorf("stored = %+v, want url %s, expiry %v, deleted %v", got, tt.wantURL, tt.wantExpires, tt.wantDeleted)
+			}
+		})
 	}
 }

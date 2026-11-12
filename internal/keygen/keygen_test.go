@@ -3,7 +3,6 @@ package keygen
 import (
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestToBase62(t *testing.T) {
@@ -27,25 +26,24 @@ func TestToBase62(t *testing.T) {
 }
 
 func TestGenerate(t *testing.T) {
-	now := time.Date(2026, 11, 12, 10, 0, 0, 0, time.UTC)
 	const url = "https://example.com/some/long/path"
-	base := Generate(url, now, 0)
+	salt := []byte("0123456789abcdef")
+	base := Generate(url, salt)
 
 	tests := []struct {
 		name     string
 		url      string
-		now      time.Time
-		attempt  int
+		salt     []byte
 		wantSame bool // whether the key must equal base
 	}{
-		{name: "same input gives the same key", url: url, now: now, attempt: 0, wantSame: true},
-		{name: "a retry gives a new key", url: url, now: now, attempt: 1, wantSame: false},
-		{name: "a later call gives a new key", url: url, now: now.Add(time.Nanosecond), attempt: 0, wantSame: false},
-		{name: "another url gives a new key", url: url + "/x", now: now, attempt: 0, wantSame: false},
+		{name: "same input gives the same key", url: url, salt: salt, wantSame: true},
+		{name: "another salt gives a new key", url: url, salt: []byte("fedcba9876543210"), wantSame: false},
+		{name: "another url gives a new key", url: url + "/x", salt: salt, wantSame: false},
+		{name: "fresh random salt gives a new key", url: url, salt: NewSalt(), wantSame: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			key := Generate(tt.url, tt.now, tt.attempt)
+			key := Generate(tt.url, tt.salt)
 			if len(key) != Length {
 				t.Fatalf("len(%q) = %d, want %d", key, len(key), Length)
 			}
@@ -55,8 +53,29 @@ func TestGenerate(t *testing.T) {
 				}
 			}
 			if same := key == base; same != tt.wantSame {
-				t.Errorf("Generate(%q, %v, %d) = %q, base %q: same = %v, want %v",
-					tt.url, tt.now, tt.attempt, key, base, same, tt.wantSame)
+				t.Errorf("Generate(%q, %x) = %q, base %q: same = %v, want %v", tt.url, tt.salt, key, base, same, tt.wantSame)
+			}
+		})
+	}
+}
+
+func TestNewSalt(t *testing.T) {
+	tests := []struct {
+		name  string
+		calls int
+	}{
+		{name: "one salt", calls: 1},
+		{name: "1000 salts are distinct", calls: 1000},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			seen := map[string]bool{}
+			for range tt.calls {
+				s := NewSalt()
+				if len(s) != SaltSize || seen[string(s)] {
+					t.Fatalf("salt %x: wrong size or repeated", s)
+				}
+				seen[string(s)] = true
 			}
 		})
 	}

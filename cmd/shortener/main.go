@@ -16,12 +16,14 @@ import (
 	"time"
 
 	"github.com/pristupaanastasia/shortener/internal/account"
+	"github.com/pristupaanastasia/shortener/internal/analytics"
 	"github.com/pristupaanastasia/shortener/internal/cache"
 	"github.com/pristupaanastasia/shortener/internal/httpapi"
 	"github.com/pristupaanastasia/shortener/internal/idempotency"
 	"github.com/pristupaanastasia/shortener/internal/link"
 	"github.com/pristupaanastasia/shortener/internal/ratelimit"
 	"github.com/pristupaanastasia/shortener/internal/storage/cassandra"
+	"github.com/pristupaanastasia/shortener/internal/storage/clickhouse"
 	"github.com/pristupaanastasia/shortener/internal/storage/memory"
 	"github.com/pristupaanastasia/shortener/internal/storage/postgres"
 )
@@ -33,6 +35,14 @@ type config struct {
 	cassandra   cassandra.Config
 	redisAddr   string // empty: no cache, rate limiting or idempotency
 	postgresDSN string // empty: in-memory accounts
+
+	// Requests per minute; zero means the httpapi defaults.
+	anonymousLimit int
+	userLimit      int
+
+	kafkaBrokers  []string // empty: clicks are not published
+	clickhouseDSN string   // empty: no statistics endpoint
+	countryHeader string   // header with the client's country, set by the edge
 }
 
 func loadConfig() (config, error) {
@@ -42,6 +52,9 @@ func loadConfig() (config, error) {
 		storage:     getenv("STORAGE", "memory"),
 		redisAddr:   os.Getenv("REDIS_ADDR"),
 		postgresDSN: os.Getenv("POSTGRES_DSN"),
+
+		clickhouseDSN: os.Getenv("CLICKHOUSE_DSN"),
+		countryHeader: os.Getenv("COUNTRY_HEADER"),
 		cassandra: cassandra.Config{
 			Hosts:    strings.Split(getenv("CASSANDRA_HOSTS", "127.0.0.1"), ","),
 			Keyspace: getenv("CASSANDRA_KEYSPACE", "shortener"),
@@ -55,6 +68,24 @@ func loadConfig() (config, error) {
 		return config{}, fmt.Errorf("CASSANDRA_REPLICATION_FACTOR: %w", err)
 	}
 	cfg.cassandra.ReplicationFactor = rf
+	for _, limit := range []struct {
+		env string
+		dst *int
+	}{
+		{"RATE_LIMIT_ANONYMOUS", &cfg.anonymousLimit},
+		{"RATE_LIMIT_USER", &cfg.userLimit},
+	} {
+		if v := os.Getenv(limit.env); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 1 {
+				return config{}, fmt.Errorf("%s must be a positive integer", limit.env)
+			}
+			*limit.dst = n
+		}
+	}
+	if brokers := os.Getenv("KAFKA_BROKERS"); brokers != "" {
+		cfg.kafkaBrokers = strings.Split(brokers, ",")
+	}
 	return cfg, nil
 }
 
@@ -124,7 +155,7 @@ func run(logger *slog.Logger) error {
 	}
 	defer closeAccounts()
 
-	api := httpapi.Config{BaseURL: cfg.baseURL, Logger: logger}
+	api := httpapi.Config{BaseURL: cfg.baseURL, Logger: logger, AnonymousLimit: cfg.anonymousLimit, UserLimit: cfg.userLimit}
 	if cfg.redisAddr != "" {
 		rdb := cache.NewRedisClient(cfg.redisAddr)
 		defer rdb.Close()
@@ -142,10 +173,31 @@ func run(logger *slog.Logger) error {
 	api.Links = link.NewService(store, baseURL.Host)
 	api.Accounts = account.NewService(accounts)
 
+	if len(cfg.kafkaBrokers) > 0 {
+		publisher, err := analytics.NewKafkaPublisher(cfg.kafkaBrokers, logger)
+		if err != nil {
+			return err
+		}
+		defer publisher.Close() // after the server has stopped: flushes buffered clicks
+		api.Clicks = publisher
+		api.CountryHeader = cfg.countryHeader
+	}
+	if cfg.clickhouseDSN != "" {
+		// Statistics are optional for this service: an unreachable ClickHouse
+		// must not stop redirects. /stats answers 503 until it connects.
+		stats := clickhouse.NewLazyStats(ctx, cfg.clickhouseDSN)
+		if err := stats.Err(); err != nil {
+			logger.Warn("clickhouse unavailable, /stats returns 503 until it recovers", "err", err)
+		}
+		defer stats.Close()
+		api.Stats = stats
+	}
+
 	srv := &http.Server{
 		Addr:              cfg.addr,
 		Handler:           httpapi.New(api),
 		ReadHeaderTimeout: 5 * time.Second,
+		MaxHeaderBytes:    64 << 10,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       60 * time.Second,
@@ -153,7 +205,8 @@ func run(logger *slog.Logger) error {
 
 	errc := make(chan error, 1)
 	go func() {
-		logger.Info("listening", "addr", cfg.addr, "base_url", cfg.baseURL, "storage", cfg.storage, "redis", cfg.redisAddr != "", "postgres", cfg.postgresDSN != "")
+		logger.Info("listening", "addr", cfg.addr, "base_url", cfg.baseURL, "storage", cfg.storage, "redis", cfg.redisAddr != "", "postgres", cfg.postgresDSN != "",
+			"kafka", len(cfg.kafkaBrokers) > 0, "clickhouse", cfg.clickhouseDSN != "")
 		errc <- srv.ListenAndServe()
 	}()
 

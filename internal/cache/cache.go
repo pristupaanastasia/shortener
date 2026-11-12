@@ -176,8 +176,17 @@ func (s *Store) Get(ctx context.Context, key string) (link.Link, error) {
 }
 
 // Update implements link.Store and invalidates the cached link.
-func (s *Store) Update(ctx context.Context, l link.Link) error {
-	if err := s.next.Update(ctx, l); err != nil {
+func (s *Store) Update(ctx context.Context, l link.Link, f link.Fields) error {
+	if err := s.next.Update(ctx, l, f); err != nil {
+		return err
+	}
+	s.Invalidate(ctx, l.Key)
+	return nil
+}
+
+// Delete implements link.Store and invalidates the cached link.
+func (s *Store) Delete(ctx context.Context, l link.Link) error {
+	if err := s.next.Delete(ctx, l); err != nil {
 		return err
 	}
 	s.Invalidate(ctx, l.Key)

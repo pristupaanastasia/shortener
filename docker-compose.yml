@@ -1,3 +1,7 @@
+# The project name is fixed, so every checkout (including git worktrees)
+# shares one stack instead of starting a second one on the same ports.
+name: shortener
+
 services:
   cassandra:
     image: cassandra:5.0
@@ -46,6 +50,42 @@ services:
       timeout: 3s
       retries: 10
 
+  kafka:
+    image: apache/kafka:3.9.0
+    ports:
+      - "9092:9092"
+    # The image defaults to a single-node KRaft broker advertised on
+    # localhost:9092, which is what the service and tests connect to.
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    ports:
+      - "9000:9000"
+    environment:
+      CLICKHOUSE_DB: shortener
+      CLICKHOUSE_USER: shortener
+      CLICKHOUSE_PASSWORD: shortener # local development only
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --user shortener --password shortener --query 'SELECT 1' > /dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
 volumes:
+  clickhouse-data:
   cassandra-data:
   postgres-data:

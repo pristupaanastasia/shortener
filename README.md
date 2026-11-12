@@ -144,7 +144,7 @@ The network is not a bottleneck.
 
   Implementation details:
   - **Fixed window** of one minute, a counter per subject in Redis (`INCR` + `EXPIRE` in one transaction), shared by all instances. The simplest algorithm; the trade-off is a burst of up to 2× the limit around a window boundary.
-  - **Limits:** 100 requests/min per user, 10 requests/min per IP for requests without a valid API key.
+  - **Limits:** 100 requests/min per user, 10 requests/min per IP for requests without a valid API key (configurable with `RATE_LIMIT_USER` and `RATE_LIMIT_ANONYMOUS`).
   - The limit is checked **before** an invalid API key is rejected, so guessing keys counts against the IP quota.
   - The client IP is the TCP peer address. `X-Forwarded-For` is not trusted: behind a load balancer, read only the balancer's own header.
   - If Redis is unavailable, requests are allowed (fail open): rate limiting must not take the API down.
@@ -281,7 +281,7 @@ Authorization: Bearer <api_key>
 }
 ```
 
-Cursor pagination instead of offset: `OFFSET N` makes the database scan and discard N rows and shifts when new links are inserted. A cursor (encoded `created_at + key` of the last item) becomes `WHERE (created_at, key) < (...) LIMIT 50`, which is fast at any depth and stable.
+Cursor pagination instead of offset: `OFFSET N` makes the database scan and discard N rows and shifts when new links are inserted. A cursor marks the position after the last item, so each page is a range read that is fast at any depth and stable. The cursor is opaque: the Cassandra store uses Cassandra's own paging state (base64-encoded), the in-memory store encodes `created_at + key`. An invalid cursor returns `400 invalid_cursor`.
 
 #### Update a link
 
@@ -336,7 +336,11 @@ Authorization: Bearer <api_key>
 }
 ```
 
-`updated_at` shows data freshness: analytics is asynchronous (Kafka → ClickHouse) and lags by minutes.
+`updated_at` is the time of the latest ingested click of the link (`null` if none; kept beyond the 90-day retention of raw clicks): analytics is asynchronous (Kafka → ClickHouse), so it shows how fresh the numbers are.
+
+- Days are UTC; `from`/`to` default to the last 30 days, the range is at most 366 days, and only `granularity=day` is supported.
+- Each dimension returns its top 10 values.
+- Errors: 401 without a key, 404 for missing or other users' links, 400 for invalid dates, 503 `analytics_unavailable` when ClickHouse is not configured or unreachable.
 
 ## Data Model
 
@@ -501,14 +505,14 @@ All services are **stateless**: state lives only in the storage layer, so servic
 ### Flow 2: Create a link
 
 1. **Load Balancer → API Gateway:**
-   - API key check (PostgreSQL, cached in Redis);
+   - API key check: PostgreSQL, with valid keys cached in memory for 1 minute (revoking a key takes effect within a minute). A key that is not cached is first counted against the per-IP rate limit, so guessing keys costs no database queries once the client is limited;
    - rate limit: `INCR` a counter in Redis, return 429 when exceeded;
    - if `Idempotency-Key` is present: `SET NX` in Redis; if the key already exists, return the stored response.
 2. **Link Service:**
    - URL validation: `http`/`https` scheme, length, not pointing to our own domain (prevents redirect loops);
    - **with alias:** `INSERT ... IF NOT EXISTS` (LWT); 409 if the row already exists;
    - **without alias:** generate a key and insert it with `IF NOT EXISTS`; on collision, retry with a new key.
-3. **Cassandra:** insert into `links` with `IF NOT EXISTS` (this is what guarantees key uniqueness), then, for links with an owner, a plain insert into `links_by_user`. Both with consistency `QUORUM` (2 of 3 replicas) to guarantee durability. They cannot be combined into one batch: Cassandra rejects conditional batches that span tables.
+3. **Cassandra:** insert into `links` with `IF NOT EXISTS` (this is what guarantees key uniqueness), then, for links with an owner, a plain insert into `links_by_user` (retried up to 3 times: once `links` is written, the key is taken, so a failed listing write could not be repaired by retrying the request; if all attempts fail, the link works but is missing from the owner's listing). Both with consistency `QUORUM` (2 of 3 replicas) to guarantee durability. They cannot be combined into one batch: Cassandra rejects conditional batches that span tables.
 4. Respond **201**.
 
 The cache is **not warmed** on creation: most links never become hot, and the first click populates the cache.
@@ -517,7 +521,8 @@ The cache is **not warmed** on creation: most links never become hot, and the fi
 
 1. API Gateway: auth, rate limit.
 2. Link Service checks that the link's `user_id` matches the API key owner; otherwise 404.
-3. Update both Cassandra tables with `QUORUM`.
+3. Update both Cassandra tables with `QUORUM`, writing **only the changed columns** with a lightweight transaction `IF created_at = ? AND deleted_at = null`. The link read in step 2 may be stale (another instance's cache), so the check that the link exists and is not deleted happens in the database: a stale read can neither undelete a link nor revert a concurrent change of another field. (Found in review: writing the whole row back let a PATCH through a stale cache resurrect a deleted link.)
+   - Delete sets `deleted_at` with the same kind of condition and always deletes the `links_by_user` row, so repeating a DELETE repairs a listing left behind by an earlier failure.
 4. Invalidate the cache with a **delayed double delete**: `DEL link:abc1234` in Redis and L1, and again after ~1 s. The second delete removes a stale value written back by a concurrent reader that loaded it from Cassandra before the update. Other instances' L1 entries expire within 10 s.
 5. Browsers pick up the change within ≤ 90 seconds (`max-age`).
 
@@ -525,13 +530,15 @@ This is the **cache-aside** pattern: the application reads the cache, falls back
 
 ### Flow 4: Analytics
 
-1. The Redirect Service publishes `{key, timestamp, ip, user_agent, referrer}` to the Kafka topic `clicks`, **partitioned by `key`** (all clicks of a link go to the same partition).
-2. **Analytics Consumers** read in batches:
-   - IP → country (local GeoIP database);
-   - User-Agent → device type;
-   - **the IP is then discarded**: it is personal data and is not stored without a reason (GDPR).
-3. Events are inserted into ClickHouse in batches of ~10K rows (ClickHouse handles large inserts well and small ones poorly).
-4. **Materialized views** in ClickHouse maintain daily and per-country aggregates; the Stats Service reads those instead of raw events.
+1. The Redirect Service publishes `{key, timestamp, country, user_agent, referrer_host}` to the Kafka topic `clicks`, **keyed by `key`** (all clicks of a link go to the same partition). Publishing never blocks: events are buffered in memory (up to 100K events or 64 MB) and sent in batches; when the buffer is full, new events are dropped and counted. Events stay small: only the referrer's host is sent (paths and queries may contain personal data) and the User-Agent is cut to 512 bytes.
+   - **No IP address enters the pipeline.** The country comes from a header set by the CDN or load balancer (e.g. Cloudflare's `CF-IPCountry`, configured with `COUNTRY_HEADER`). This avoids storing personal data (GDPR) and needs no GeoIP database. The header is read only when configured, since clients could send it themselves.
+2. **Analytics Consumers** (`cmd/consumer`, scaled independently) read in batches:
+   - User-Agent → device type (desktop, mobile, tablet, bot);
+   - malformed events are logged and skipped, so they cannot block a partition.
+3. Events are inserted into ClickHouse in batches of up to 10K rows or every second (ClickHouse handles large inserts well and small ones poorly).
+   - **At-least-once delivery:** offsets are committed only after a successful insert. A crash between the two re-inserts that batch, so a click can be counted twice; none are lost. Failed inserts are retried with backoff; if the consumer is stopped during retries, it makes one last attempt and exits with an error **without** committing, so the batch is read again on restart.
+4. **Materialized views** in ClickHouse maintain daily and per-dimension (country, device, referrer) aggregates in `SummingMergeTree` tables, plus the latest click time per link; the Stats Service reads those instead of raw events. Raw events are kept for 90 days (TTL), aggregates forever.
+5. ClickHouse is optional for the redirect service: it connects lazily, so the service starts and keeps redirecting while ClickHouse is down, and `/stats` answers 503 until the connection succeeds.
 
 Kafka acts as a **buffer**: if ClickHouse is slow or down, events accumulate in Kafka (retained e.g. for 7 days) and are written later. Nothing is lost and redirects are unaffected.
 
@@ -573,21 +580,25 @@ The **Cleanup Worker** runs daily, finds links with `expires_at` in the past and
 ### Chosen Approach: Salted Hash + LWT + Retry
 
 ```go
-func generateKey(longURL string, attempt int) string {
-    // the salt makes shortening the same URL twice produce different keys (requirement 8)
-    input := fmt.Sprintf("%s|%d|%d", longURL, time.Now().UnixNano(), attempt)
-    sum := sha256.Sum256([]byte(input))
-    n := binary.BigEndian.Uint64(sum[:8]) % 3_521_614_606_208 // 62^7
+func Generate(longURL string, salt []byte) string {
+    // a fresh random salt per attempt (16 bytes from crypto/rand) makes
+    // shortening the same URL twice produce different keys (requirement 8)
+    h := sha256.New()
+    h.Write(salt)
+    h.Write([]byte(longURL))
+    n := binary.BigEndian.Uint64(h.Sum(nil)[:8]) % 3_521_614_606_208 // 62^7
     return toBase62(n, 7)
 }
 ```
+
+The salt must be random, not a timestamp: with a millisecond timestamp, concurrent requests for one popular URL got the same candidate keys on every attempt and failed (found in review: 190 of 200 concurrent creates), and keys were guessable from the creation time.
 
 Insertion:
 
 ```
 attempt = 0
 loop:
-    key = generateKey(url, attempt)
+    key = Generate(url, NewSalt())
     INSERT INTO links ... IF NOT EXISTS
     if not applied: attempt++, retry (up to ~5 attempts)
 ```
@@ -595,7 +606,7 @@ loop:
 **Pros:**
 
 - Simple: one function, no counters or extra infrastructure.
-- Unpredictable: a SHA-256 of a nanosecond-salted input cannot be guessed.
+- Unpredictable: the salt is 128 random bits, so keys cannot be guessed.
 - No coordination between instances.
 - LWT is needed anyway for custom aliases, so the uniqueness check adds no new mechanism.
 
@@ -603,7 +614,7 @@ loop:
 
 - **Collisions grow over time:** the chance that a new key is taken equals `used / total`, ~1% after a year (36B / 3.5T) and ~6% after 5 years (200B / 3.5T). Each collision costs an extra LWT round-trip.
 - **Every insert is an LWT** (~4× more expensive than a regular write). Acceptable at 1–3K write RPS.
-- Because of the salt, the hash no longer depends only on the URL, so this is effectively a random key: `crypto/rand` would work equally well. The hash is just a source of randomness.
+- Because of the salt, the hash no longer depends only on the URL, so this is effectively a random key. The hash is just a way to turn randomness into a key of the right size.
 
 **Why not hash only the URL:** the same URL would always get the same key (breaks requirement 8), and truncating the hash to 7 characters still produces collisions, so a uniqueness check is required anyway.
 

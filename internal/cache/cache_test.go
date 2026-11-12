@@ -251,7 +251,7 @@ func TestUpdateInvalidates(t *testing.T) {
 		{
 			name: "update through the cache is visible at once",
 			before: func() {
-				if err := c.Update(context.Background(), link.Link{Key: "abc1234", LongURL: "https://example.com/new"}); err != nil {
+				if err := c.Update(context.Background(), link.Link{Key: "abc1234", LongURL: "https://example.com/new"}, link.Fields{LongURL: true}); err != nil {
 					t.Fatal(err)
 				}
 			},
@@ -276,7 +276,7 @@ func TestRedisDown(t *testing.T) {
 			return c.Create(context.Background(), link.Link{Key: "new1234", LongURL: "https://example.com/new"})
 		}},
 		{name: "update still works", action: func(c *Store) error {
-			return c.Update(context.Background(), link.Link{Key: "abc1234", LongURL: "https://example.com/new"})
+			return c.Update(context.Background(), link.Link{Key: "abc1234", LongURL: "https://example.com/new"}, link.Fields{LongURL: true})
 		}},
 	}
 	for _, tt := range tests {

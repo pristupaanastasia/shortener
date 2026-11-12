@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
+	"strings"
 	"time"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
@@ -34,10 +36,10 @@ type Store struct {
 	insertLink       string
 	insertLinkByUser string
 	selectLink       string
-	updateLink       string
-	updateLinkByUser string
+	deleteLink       string
 	deleteLinkByUser string
 	listLinksByUser  string
+	ks               string
 }
 
 // Open connects to Cassandra, creates the keyspace and tables if they do not
@@ -80,14 +82,15 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 			VALUES (?, ?, ?, ?, ?)`, ks),
 		selectLink: fmt.Sprintf(`SELECT long_url, user_id, created_at, expires_at, deleted_at
 			FROM %s.links WHERE key = ?`, ks),
-		updateLink: fmt.Sprintf(`UPDATE %s.links SET long_url = ?, expires_at = ?, deleted_at = ?
-			WHERE key = ? IF EXISTS`, ks),
-		updateLinkByUser: fmt.Sprintf(`UPDATE %s.links_by_user SET long_url = ?, expires_at = ?
-			WHERE user_id = ? AND created_at = ? AND key = ?`, ks),
+		// created_at never changes, so "created_at = ?" doubles as "the row
+		// exists": a condition on a missing row's columns would compare nulls.
+		deleteLink: fmt.Sprintf(`UPDATE %s.links SET deleted_at = ?
+			WHERE key = ? IF created_at = ? AND deleted_at = null`, ks),
 		deleteLinkByUser: fmt.Sprintf(`DELETE FROM %s.links_by_user
 			WHERE user_id = ? AND created_at = ? AND key = ?`, ks),
 		listLinksByUser: fmt.Sprintf(`SELECT key, long_url, created_at, expires_at
 			FROM %s.links_by_user WHERE user_id = ?`, ks),
+		ks: ks,
 	}, nil
 }
 
@@ -174,14 +177,25 @@ func (s *Store) Create(ctx context.Context, l link.Link) error {
 	if userID == nil {
 		return nil
 	}
-	err = s.session.Query(s.insertLinkByUser,
-		userID, l.CreatedAt, l.Key, l.LongURL, l.ExpiresAt,
-	).ExecContext(ctx)
-	if err != nil {
-		return fmt.Errorf("insert link %q into links_by_user: %w", l.Key, err)
+	// The link is stored at this point; a failure here would leave it out of
+	// its owner's listing, and a retry of the request could not repair it
+	// (the key is now taken). The insert is idempotent, so retry it.
+	for attempt := 1; ; attempt++ {
+		err = s.session.Query(s.insertLinkByUser,
+			userID, l.CreatedAt, l.Key, l.LongURL, l.ExpiresAt,
+		).ExecContext(ctx)
+		if err == nil {
+			return nil
+		}
+		if attempt == listingWriteAttempts || ctx.Err() != nil {
+			return fmt.Errorf("insert link %q into links_by_user: %w", l.Key, err)
+		}
+		time.Sleep(time.Duration(attempt) * 50 * time.Millisecond)
 	}
-	return nil
 }
+
+// listingWriteAttempts bounds retries of the links_by_user insert in Create.
+const listingWriteAttempts = 3
 
 // Get implements link.Store.
 func (s *Store) Get(ctx context.Context, key string) (link.Link, error) {
@@ -202,30 +216,67 @@ func (s *Store) Get(ctx context.Context, key string) (link.Link, error) {
 	return l, nil
 }
 
-// Update implements link.Store. The links row is updated with a lightweight
-// transaction (IF EXISTS), so an update never creates a row; links_by_user is
-// then brought in line: updated, or removed for a deleted link.
-func (s *Store) Update(ctx context.Context, l link.Link) error {
-	applied, err := s.session.Query(s.updateLink,
-		l.LongURL, l.ExpiresAt, l.DeletedAt, l.Key,
-	).MapScanCASContext(ctx, map[string]any{})
+// Update implements link.Store. Only the selected columns are written, with
+// a lightweight transaction that requires the link to exist (created_at
+// matches) and not be deleted, so an update based on a stale read cannot
+// undelete a link or revert a concurrent change of another column.
+func (s *Store) Update(ctx context.Context, l link.Link, f link.Fields) error {
+	var set []string
+	var args []any
+	if f.LongURL {
+		set, args = append(set, "long_url = ?"), append(args, l.LongURL)
+	}
+	if f.ExpiresAt {
+		set, args = append(set, "expires_at = ?"), append(args, l.ExpiresAt)
+	}
+	if len(set) == 0 {
+		return nil
+	}
+	assignments := strings.Join(set, ", ")
+
+	stmt := fmt.Sprintf(`UPDATE %s.links SET %s WHERE key = ? IF created_at = ? AND deleted_at = null`, s.ks, assignments)
+	applied, err := s.session.Query(stmt, append(args, l.Key, l.CreatedAt)...).MapScanCASContext(ctx, map[string]any{})
 	if err != nil {
 		return fmt.Errorf("update link %q: %w", l.Key, err)
 	}
 	if !applied {
-		return link.ErrNotFound
+		return link.ErrNotFound // missing or deleted
 	}
 
 	userID, err := parseUserID(l.UserID)
 	if err != nil || userID == nil {
 		return err
 	}
-	q := s.session.Query(s.updateLinkByUser, l.LongURL, l.ExpiresAt, userID, l.CreatedAt, l.Key)
-	if l.DeletedAt != nil {
-		q = s.session.Query(s.deleteLinkByUser, userID, l.CreatedAt, l.Key)
-	}
-	if err := q.ExecContext(ctx); err != nil {
+	stmt = fmt.Sprintf(`UPDATE %s.links_by_user SET %s WHERE user_id = ? AND created_at = ? AND key = ?`, s.ks, assignments)
+	if err := s.session.Query(stmt, append(args, userID, l.CreatedAt, l.Key)...).ExecContext(ctx); err != nil {
 		return fmt.Errorf("update link %q in links_by_user: %w", l.Key, err)
+	}
+	return nil
+}
+
+// Delete implements link.Store. The links row keeps its first deletion time;
+// the links_by_user row is deleted on every call, so a retry repairs a listing
+// left behind when an earlier call failed between the two writes.
+func (s *Store) Delete(ctx context.Context, l link.Link) error {
+	current := map[string]any{}
+	applied, err := s.session.Query(s.deleteLink, l.DeletedAt, l.Key, l.CreatedAt).MapScanCASContext(ctx, current)
+	if err != nil {
+		return fmt.Errorf("delete link %q: %w", l.Key, err)
+	}
+	if !applied {
+		// Not applied: either the link does not exist, or it is already
+		// deleted (which is fine). The returned row tells them apart.
+		if createdAt, _ := current["created_at"].(time.Time); createdAt.IsZero() {
+			return link.ErrNotFound
+		}
+	}
+
+	userID, err := parseUserID(l.UserID)
+	if err != nil || userID == nil {
+		return err
+	}
+	if err := s.session.Query(s.deleteLinkByUser, userID, l.CreatedAt, l.Key).ExecContext(ctx); err != nil {
+		return fmt.Errorf("delete link %q from links_by_user: %w", l.Key, err)
 	}
 	return nil
 }
@@ -255,6 +306,11 @@ func (s *Store) ListByUser(ctx context.Context, userID, cursor string, limit int
 	}
 	next := iter.PageState()
 	if err := iter.Close(); err != nil {
+		// The cursor comes from the client: a paging state Cassandra cannot
+		// parse is a bad request, not a server error.
+		if cursor != "" && isRequestError(err, gocql.ErrCodeProtocol, gocql.ErrCodeInvalid) {
+			return nil, "", link.ErrInvalidCursor
+		}
 		return nil, "", fmt.Errorf("list links of user %q: %w", userID, err)
 	}
 
@@ -264,6 +320,11 @@ func (s *Store) ListByUser(ctx context.Context, userID, cursor string, limit int
 		return links, "", nil
 	}
 	return links, base64.RawURLEncoding.EncodeToString(next), nil
+}
+
+func isRequestError(err error, codes ...int) bool {
+	reqErr, ok := errors.AsType[gocql.RequestError](err)
+	return ok && slices.Contains(codes, reqErr.Code())
 }
 
 // parseUserID returns nil for anonymous links (empty id).

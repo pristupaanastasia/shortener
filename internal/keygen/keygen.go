@@ -3,10 +3,9 @@
 package keygen
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
-	"fmt"
-	"time"
 )
 
 // Length is the number of characters in a generated key.
@@ -17,12 +16,25 @@ const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz
 // keySpace is 62^Length: the number of distinct keys.
 const keySpace uint64 = 3_521_614_606_208
 
-// Generate returns a key for longURL. The timestamp and attempt number act as
-// a salt, so the same URL gets a different key on every call, and a retry
-// after a collision produces a new candidate.
-func Generate(longURL string, now time.Time, attempt int) string {
-	input := fmt.Sprintf("%s|%d|%d", longURL, now.UnixNano(), attempt)
-	sum := sha256.Sum256([]byte(input))
+// SaltSize is the number of random bytes mixed into every key.
+const SaltSize = 16
+
+// NewSalt returns random bytes for Generate.
+func NewSalt() []byte {
+	salt := make([]byte, SaltSize)
+	_, _ = rand.Read(salt) // never fails on supported platforms
+	return salt
+}
+
+// Generate returns a key for longURL and salt. A fresh random salt per call
+// makes keys unpredictable and gives the same URL a different key every time,
+// including concurrent requests: a timestamp salt would repeat within one
+// clock tick.
+func Generate(longURL string, salt []byte) string {
+	h := sha256.New()
+	h.Write(salt)
+	h.Write([]byte(longURL))
+	sum := h.Sum(nil)
 	n := binary.BigEndian.Uint64(sum[:8]) % keySpace
 	return toBase62(n, Length)
 }

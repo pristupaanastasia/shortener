@@ -108,6 +108,7 @@ func TestRepositoryMigrations(t *testing.T) {
 	}{
 		{name: "cassandra", load: func() ([]Migration, error) { return Load(migrations.Cassandra, "cassandra") }},
 		{name: "postgres", load: func() ([]Migration, error) { return Load(migrations.Postgres, "postgres") }},
+		{name: "clickhouse", load: func() ([]Migration, error) { return Load(migrations.ClickHouse, "clickhouse") }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

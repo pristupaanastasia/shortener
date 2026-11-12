@@ -89,8 +89,10 @@ func TestErrors(t *testing.T) {
 	}{
 		{name: "get missing", run: func() error { _, err := s.Get(ctx, key); return err }, wantErr: link.ErrNotFound},
 		{
-			name:    "update missing",
-			run:     func() error { return s.Update(ctx, link.Link{Key: key, LongURL: "https://example.com"}) },
+			name: "update missing",
+			run: func() error {
+				return s.Update(ctx, link.Link{Key: key, LongURL: "https://example.com", CreatedAt: now()}, link.Fields{LongURL: true})
+			},
 			wantErr: link.ErrNotFound,
 			check: func(t *testing.T) {
 				// IF EXISTS must not create the row: a plain UPDATE is an upsert.
@@ -99,6 +101,10 @@ func TestErrors(t *testing.T) {
 				}
 			},
 		},
+		{name: "delete missing", run: func() error {
+			deleted := now()
+			return s.Delete(ctx, link.Link{Key: key, CreatedAt: now(), DeletedAt: &deleted})
+		}, wantErr: link.ErrNotFound},
 		{name: "create", run: func() error { return s.Create(ctx, link.Link{Key: key, LongURL: "https://first.example"}) }},
 		{
 			name:    "duplicate keeps the original",
@@ -172,47 +178,81 @@ func TestCreateConcurrentSameKey(t *testing.T) {
 	}
 }
 
-func TestUpdateAndSoftDelete(t *testing.T) {
+func TestUpdateAndDelete(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
 	userID := gocql.MustRandomUUID().String()
-	l := link.Link{Key: uniqueKey(), LongURL: "https://example.com/old", UserID: userID, CreatedAt: now()}
-	deleted := now()
+	created := link.Link{Key: uniqueKey(), LongURL: "https://example.com/old", UserID: userID, CreatedAt: now()}
+	stale := created // a copy read before the changes below, like a stale cache entry
+	deletedAt := now()
+	expires := now().Add(time.Hour)
 
 	steps := []struct {
-		name       string
-		update     func(*link.Link) // nil: create the link
-		wantURL    string
-		wantListed bool
+		name        string
+		run         func() error
+		wantErr     error
+		wantURL     string
+		wantExpires bool
+		wantDeleted bool
+		wantListed  bool
 	}{
-		{name: "created", wantURL: "https://example.com/old", wantListed: true},
-		{name: "url changed in both tables", update: func(l *link.Link) { l.LongURL = "https://example.com/new" }, wantURL: "https://example.com/new", wantListed: true},
-		{name: "soft delete hides from listing", update: func(l *link.Link) { l.DeletedAt = &deleted }, wantURL: "https://example.com/new", wantListed: false},
+		{name: "create", run: func() error { return s.Create(ctx, created) },
+			wantURL: "https://example.com/old", wantListed: true},
+		{name: "update url in both tables", run: func() error {
+			l := created
+			l.LongURL = "https://example.com/new"
+			return s.Update(ctx, l, link.Fields{LongURL: true})
+		}, wantURL: "https://example.com/new", wantListed: true},
+		{name: "expiry from a stale copy keeps the new url", run: func() error {
+			l := stale
+			l.ExpiresAt = &expires
+			return s.Update(ctx, l, link.Fields{ExpiresAt: true})
+		}, wantURL: "https://example.com/new", wantExpires: true, wantListed: true},
+		{name: "delete", run: func() error {
+			l := created
+			l.DeletedAt = &deletedAt
+			return s.Delete(ctx, l)
+		}, wantURL: "https://example.com/new", wantExpires: true, wantDeleted: true},
+		{name: "update from a stale copy does not undelete", run: func() error {
+			l := stale
+			l.LongURL = "https://example.com/resurrected"
+			return s.Update(ctx, l, link.Fields{LongURL: true})
+		}, wantErr: link.ErrNotFound, wantURL: "https://example.com/new", wantExpires: true, wantDeleted: true},
+		{name: "repeated delete repairs a leftover listing row", run: func() error {
+			// Simulate a failure between the two writes of an earlier delete.
+			if err := s.session.Query(s.insertLinkByUser, mustUUID(t, userID), created.CreatedAt, created.Key, "https://example.com/new", nil).ExecContext(ctx); err != nil {
+				return err
+			}
+			l := created
+			later := deletedAt.Add(time.Hour)
+			l.DeletedAt = &later
+			return s.Delete(ctx, l)
+		}, wantURL: "https://example.com/new", wantExpires: true, wantDeleted: true},
 	}
 	for _, step := range steps {
 		ok := t.Run(step.name, func(t *testing.T) {
-			var err error
-			if step.update == nil {
-				err = s.Create(ctx, l)
-			} else {
-				step.update(&l)
-				err = s.Update(ctx, l)
+			if err := step.run(); !errors.Is(err, step.wantErr) {
+				t.Fatalf("err = %v, want %v", err, step.wantErr)
 			}
+			got, err := s.Get(ctx, created.Key)
 			if err != nil {
 				t.Fatal(err)
 			}
-
-			got, err := s.Get(ctx, l.Key)
-			if err != nil || got.LongURL != step.wantURL || (got.DeletedAt != nil) != (l.DeletedAt != nil) {
-				t.Fatalf("links row = %+v, %v; want long_url %s, deleted %v", got, err, step.wantURL, l.DeletedAt != nil)
+			if got.LongURL != step.wantURL || (got.ExpiresAt != nil) != step.wantExpires || (got.DeletedAt != nil) != step.wantDeleted {
+				t.Errorf("links row = %+v; want url %s, expiry %v, deleted %v", got, step.wantURL, step.wantExpires, step.wantDeleted)
+			}
+			if got.DeletedAt != nil && !got.DeletedAt.Equal(deletedAt) {
+				t.Errorf("DeletedAt = %v, want the first deletion time %v", got.DeletedAt, deletedAt)
 			}
 			page, _, err := s.ListByUser(ctx, userID, "", 10)
 			if err != nil {
 				t.Fatal(err)
 			}
-			listed := len(page) == 1 && page[0].Key == l.Key && page[0].LongURL == step.wantURL
-			if listed != step.wantListed || (!step.wantListed && len(page) != 0) {
+			if listed := len(page) == 1 && page[0].Key == created.Key; listed != step.wantListed || len(page) > 1 {
 				t.Errorf("links_by_user = %+v, want listed %v", page, step.wantListed)
+			}
+			if step.wantListed && page[0].LongURL != step.wantURL {
+				t.Errorf("links_by_user url = %q, want %q", page[0].LongURL, step.wantURL)
 			}
 		})
 		if !ok {
@@ -287,6 +327,8 @@ func TestListByUserErrors(t *testing.T) {
 		wantErr error
 	}{
 		{name: "cursor not base64", user: gocql.MustRandomUUID().String(), cursor: "!!!not-base64", wantErr: link.ErrInvalidCursor},
+		{name: "base64 cursor that is not a paging state", user: gocql.MustRandomUUID().String(), cursor: "AAAA", wantErr: link.ErrInvalidCursor},
+		{name: "base64 text as a cursor", user: gocql.MustRandomUUID().String(), cursor: "bm90LWpzb24", wantErr: link.ErrInvalidCursor},
 		{name: "user id not a uuid", user: "not-a-uuid", wantErr: link.ErrNotFound},
 	}
 	for _, tt := range tests {
@@ -319,4 +361,13 @@ func TestServiceEndToEnd(t *testing.T) {
 			}
 		})
 	}
+}
+
+func mustUUID(t *testing.T, s string) gocql.UUID {
+	t.Helper()
+	u, err := gocql.ParseUUID(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u
 }

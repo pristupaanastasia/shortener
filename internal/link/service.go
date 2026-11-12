@@ -24,7 +24,7 @@ type Service struct {
 	ownHost string
 	now     func() time.Time
 	// generate returns a candidate key; replaced in tests to force collisions.
-	generate func(longURL string, now time.Time, attempt int) string
+	generate func(longURL string, attempt int) string
 }
 
 // NewService returns a Service backed by store. ownHost is the service's own
@@ -34,7 +34,7 @@ func NewService(store Store, ownHost string) *Service {
 		store:    store,
 		ownHost:  ownHost,
 		now:      time.Now,
-		generate: keygen.Generate,
+		generate: func(longURL string, _ int) string { return keygen.Generate(longURL, keygen.NewSalt()) },
 	}
 }
 
@@ -82,7 +82,7 @@ func (s *Service) Create(ctx context.Context, p CreateParams) (Link, error) {
 	}
 
 	for attempt := range maxKeyAttempts {
-		l.Key = s.generate(p.LongURL, now, attempt)
+		l.Key = s.generate(p.LongURL, attempt)
 		err := s.store.Create(ctx, l)
 		if errors.Is(err, ErrKeyTaken) {
 			continue
@@ -136,19 +136,29 @@ func (s *Service) Update(ctx context.Context, userID, key string, p UpdateParams
 	if err != nil {
 		return Link{}, err
 	}
+	var f Fields
 	if p.LongURL != nil {
 		if err := validateURL(*p.LongURL, s.ownHost); err != nil {
 			return Link{}, err
 		}
-		l.LongURL = *p.LongURL
+		l.LongURL, f.LongURL = *p.LongURL, true
 	}
 	if p.SetExpiresAt {
 		if err := validateExpiry(p.ExpiresAt, s.now()); err != nil {
 			return Link{}, err
 		}
-		l.ExpiresAt = p.ExpiresAt
+		l.ExpiresAt, f.ExpiresAt = p.ExpiresAt, true
 	}
-	if err := s.store.Update(ctx, l); err != nil {
+	if !f.LongURL && !f.ExpiresAt {
+		return l, nil
+	}
+	// The read above may be stale (e.g. from another instance's cache): the
+	// store re-checks that the link is not deleted and writes only f.
+	err = s.store.Update(ctx, l, f)
+	if errors.Is(err, ErrNotFound) {
+		return Link{}, ErrNotFound
+	}
+	if err != nil {
 		return Link{}, fmt.Errorf("update link %q: %w", key, err)
 	}
 	return l, nil
@@ -164,12 +174,13 @@ func (s *Service) Delete(ctx context.Context, userID, key string) error {
 	if userID == "" || l.UserID != userID {
 		return ErrNotFound
 	}
-	if l.DeletedAt != nil {
-		return nil
+	// Even an already deleted link goes to the store: Delete is idempotent
+	// and repairs the owner's listing if an earlier attempt failed halfway.
+	if l.DeletedAt == nil {
+		now := s.timestamp()
+		l.DeletedAt = &now
 	}
-	now := s.timestamp()
-	l.DeletedAt = &now
-	if err := s.store.Update(ctx, l); err != nil {
+	if err := s.store.Delete(ctx, l); err != nil {
 		return fmt.Errorf("delete link %q: %w", key, err)
 	}
 	return nil

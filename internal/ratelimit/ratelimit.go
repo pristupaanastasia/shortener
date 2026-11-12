@@ -27,9 +27,21 @@ type Limiter struct {
 	now   func() time.Time
 }
 
+// Option configures a Limiter.
+type Option func(*Limiter)
+
+// WithClock replaces time.Now, so tests do not depend on window boundaries.
+func WithClock(now func() time.Time) Option {
+	return func(l *Limiter) { l.now = now }
+}
+
 // New returns a Limiter backed by rdb.
-func New(rdb *redis.Client) *Limiter {
-	return &Limiter{redis: rdb, now: time.Now}
+func New(rdb *redis.Client, opts ...Option) *Limiter {
+	l := &Limiter{redis: rdb, now: time.Now}
+	for _, opt := range opts {
+		opt(l)
+	}
+	return l
 }
 
 // Allow records a request by subject (e.g. "user:<id>" or "ip:<addr>") and
