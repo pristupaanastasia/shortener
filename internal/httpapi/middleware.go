@@ -183,14 +183,19 @@ func (h *Handler) withIdempotency(w http.ResponseWriter, r *http.Request, handle
 	rw := &recorder{header: http.Header{}, status: http.StatusOK}
 	handle(rw, body)
 
+	// Store the outcome even if the client has gone away: a client that timed
+	// out is exactly the one that will retry.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Second)
+	defer cancel()
+
 	// A server error may be transient: release the key so a retry runs again.
 	// Client errors are deterministic and are replayed like successes.
 	if rw.status >= http.StatusInternalServerError {
-		if err := h.idempotency.Abort(r.Context(), scope, key); err != nil {
+		if err := h.idempotency.Abort(ctx, scope, key); err != nil {
 			h.logger.Warn("release idempotency key", "err", err)
 		}
 	} else {
-		err := h.idempotency.Complete(r.Context(), scope, key, idempotency.Record{
+		err := h.idempotency.Complete(ctx, scope, key, idempotency.Record{
 			Fingerprint: fingerprint, Status: rw.status, Body: rw.body.Bytes(),
 		})
 		if err != nil {

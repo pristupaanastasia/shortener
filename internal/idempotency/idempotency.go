@@ -13,8 +13,13 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// DefaultTTL is how long a key and its response are kept.
+// DefaultTTL is how long a key and its stored response are kept.
 const DefaultTTL = 24 * time.Hour
+
+// PendingTTL bounds how long a key stays "in progress". If the request never
+// completes (crash, Redis failure), the key frees itself instead of blocking
+// retries for DefaultTTL. Requests are much shorter than this.
+const PendingTTL = time.Minute
 
 // Record is the state of an idempotency key.
 type Record struct {
@@ -44,7 +49,7 @@ func redisKey(scope, key string) string { return "idem:" + scope + ":" + key }
 // returns the existing record: pending, or the stored response.
 func (s *Store) Begin(ctx context.Context, scope, key, fingerprint string) (rec Record, started bool, err error) {
 	pending, _ := json.Marshal(Record{Fingerprint: fingerprint, Pending: true})
-	ok, err := s.redis.SetNX(ctx, redisKey(scope, key), pending, s.ttl).Result()
+	ok, err := s.redis.SetNX(ctx, redisKey(scope, key), pending, PendingTTL).Result()
 	if err != nil {
 		return Record{}, false, fmt.Errorf("claim idempotency key: %w", err)
 	}

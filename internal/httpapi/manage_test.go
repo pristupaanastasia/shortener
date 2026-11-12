@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -451,4 +452,64 @@ func TestIdempotency(t *testing.T) {
 		{name: "client error is stored", req: static(bad), wantStatus: http.StatusBadRequest, check: replayed(false)},
 		{name: "client error is replayed", req: static(bad), wantStatus: http.StatusBadRequest, check: replayed(true)},
 	})
+}
+
+// cancelingStore cancels the request context right after a successful create,
+// like a client that times out and disconnects while the link is being stored.
+type cancelingStore struct {
+	*memory.Store
+	cancel context.CancelFunc
+}
+
+func (s *cancelingStore) Create(ctx context.Context, l link.Link) error {
+	err := s.Store.Create(ctx, l)
+	s.cancel()
+	return err
+}
+
+// Regression: the response was stored with the request context, so after a
+// disconnect the key stayed "in progress" and every retry got 409 for 24h.
+func TestIdempotencyAfterClientDisconnect(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	store := &cancelingStore{Store: memory.New()}
+	h := New(Config{
+		Links:       link.NewService(store, "sho.rt"),
+		Accounts:    account.NewService(memory.NewAccounts()),
+		Limiter:     ratelimit.New(rdb),
+		Idempotency: idempotency.New(rdb, idempotency.DefaultTTL),
+		BaseURL:     "https://sho.rt",
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+
+	tests := []struct {
+		name         string
+		disconnect   bool
+		wantStatus   int
+		wantReplayed bool
+	}{
+		{name: "client disconnects after the link is stored", disconnect: true, wantStatus: http.StatusCreated},
+		{name: "retry gets the original response", wantStatus: http.StatusCreated, wantReplayed: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			store.cancel = func() {}
+			if tt.disconnect {
+				store.cancel = cancel
+			}
+			req := httptest.NewRequestWithContext(ctx, "POST", "/api/v1/links", strings.NewReader(`{"long_url":"https://example.com"}`))
+			req.Header.Set("Idempotency-Key", "disconnect-1")
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d; body: %s", rec.Code, tt.wantStatus, rec.Body)
+			}
+			if got := rec.Header().Get("Idempotent-Replayed") == "true"; got != tt.wantReplayed {
+				t.Errorf("Idempotent-Replayed = %v, want %v", got, tt.wantReplayed)
+			}
+		})
+	}
 }
