@@ -363,6 +363,216 @@ CREATE TABLE links_by_user (
 
 1. **No `UNIQUE` constraint.** An insert with an existing key silently overwrites the old row.
    - Custom aliases use a Lightweight Transaction: `INSERT ... IF NOT EXISTS` (Paxos-based, ~4× slower than a regular write; acceptable at 1–3K write RPS).
-   - Generated keys skip this check if the key generator guarantees uniqueness.
+   - Generated keys use the same check: they are random, so collisions are possible (see [Deep Dive: Key Generation](#deep-dive-key-generation)).
 2. **No queries by arbitrary columns.** `WHERE user_id = ?` on `links` would hit every node, which is why `links_by_user` exists.
 3. **Native TTL is not used.** After a row expires, the redirect would return 404 instead of 410, and the alias would become free, so old links could point to someone else's content. Instead, `expires_at` is checked on read, and expired links are archived by a background job.
+
+## High-Level Design
+
+```
+                         ┌──────────┐
+                         │ Clients  │  browsers, mobile apps, API clients
+                         └────┬─────┘
+                              │
+                     ┌────────▼────────┐
+                     │  Load Balancer  │
+                     └───┬─────────┬───┘
+            sho.rt/{key} │         │ sho.rt/api/v1/*
+                         │   ┌─────▼───────┐       ┌────────────┐
+                         │   │ API Gateway │──────▶│ PostgreSQL │ users, api keys
+                         │   │ auth, rate  │       └────────────┘
+                         │   │ limit       │──┐
+                         │   └──┬───────┬──┘  │
+                         │      │       │     │
+              ┌──────────▼──┐ ┌─▼─────────┐ ┌─▼────────────┐
+              │  Redirect   │ │   Link    │ │    Stats     │
+              │  Service    │ │  Service  │ │   Service    │
+              └──┬───────┬──┘ └─┬───┬───┬─┘ └──────┬───────┘
+                 │       │      │   │   │          │
+                 │  ┌────▼──────▼┐  │ ┌─▼───────┐  │
+                 │  │   Redis    │  │ │   Key   │  │
+                 │  │   cache    │  │ │Generator│  │
+                 │  └────┬───────┘  │ └─────────┘  │
+                 │       │ miss     │              │
+                 │  ┌────▼──────────▼┐             │
+                 │  │   Cassandra    │◀── Cleanup  │
+                 │  │ links,         │    Worker   │
+                 │  │ links_by_user  │             │
+                 │  └────────────────┘             │
+                 │                                 │
+              ┌──▼─────┐   ┌───────────┐   ┌───────▼────┐
+              │ Kafka  │──▶│ Analytics │──▶│ ClickHouse │
+              │ clicks │   │ Consumers │   └────────────┘
+              └────────┘   └───────────┘
+```
+
+### Components
+
+| Component | Responsibility |
+|---|---|
+| **Load Balancer** | distributes traffic, terminates TLS, routes redirects and API separately |
+| **API Gateway** | API key auth, rate limiting (counters in Redis), idempotency |
+| **Redirect Service** | `GET /{key}` only: the most loaded and the simplest service |
+| **Link Service** | create, read, update and delete links |
+| **Key Generator** | generates 7-character keys (a library inside the Link Service, not a separate deployment) |
+| **Stats Service** | serves statistics from ClickHouse |
+| **Redis** | link cache, rate limit counters, idempotency keys |
+| **Cassandra** | primary link storage |
+| **PostgreSQL** | users and API keys |
+| **Kafka** | click event queue |
+| **Analytics Consumers** | enrich events (country from IP, device from User-Agent) and batch-insert into ClickHouse |
+| **Cleanup Worker** | archives expired links in the background |
+
+All services are **stateless**: state lives only in the storage layer, so services scale horizontally by adding instances behind the load balancer.
+
+**Why Redirect and Link are separate services:**
+
+- **Different load:** 100K vs 1K RPS, so they scale independently.
+- **Failure isolation:** bugs or overload in the API must not break redirects, which millions of people rely on.
+- **Simplicity:** minimal code in the Redirect Service means fewer reasons to fail.
+
+### Flow 1: Redirect (hot path)
+
+1. **Load Balancer** routes `GET sho.rt/abc1234` directly to the Redirect Service, bypassing the API Gateway (no auth needed, every extra hop adds latency).
+2. **Redis** `GET link:abc1234`:
+   - **hit** (most requests): go to step 4;
+   - **miss**: go to step 3.
+3. **Cassandra** `SELECT ... WHERE key = 'abc1234'` with consistency `ONE` (fastest, eventual consistency is acceptable). The result is cached in Redis with `TTL = min(1h, expires_at - now)`.
+   - **Negative caching:** a missing key is also cached as "not found" for 1–5 minutes. Otherwise a bot enumerating random keys would bypass the cache and flood Cassandra.
+4. **Checks and response:**
+   - `deleted_at` set or `expires_at` in the past: **410**;
+   - not found: **404**;
+   - otherwise: **301** + `Location` + `Cache-Control: private, max-age=N`.
+5. **Click event to Kafka**, asynchronously. The response does not wait for Kafka: the producer buffers events in memory and sends them in batches. If Kafka is unavailable, the event is dropped: redirects are more important than analytics.
+
+**Latency:** Redis ~1 ms, Cassandra on a miss ~5–10 ms, well within the 100 ms budget.
+
+### Flow 2: Create a link
+
+1. **Load Balancer → API Gateway:**
+   - API key check (PostgreSQL, cached in Redis);
+   - rate limit: `INCR` a counter in Redis, return 429 when exceeded;
+   - if `Idempotency-Key` is present: `SET NX` in Redis; if the key already exists, return the stored response.
+2. **Link Service:**
+   - URL validation: `http`/`https` scheme, length, not pointing to our own domain (prevents redirect loops);
+   - **with alias:** `INSERT ... IF NOT EXISTS` (LWT); 409 if the row already exists;
+   - **without alias:** generate a key and insert it with `IF NOT EXISTS`; on collision, retry with a new key.
+3. **Cassandra:** write to `links` and `links_by_user` in one **logged batch**, so both tables are eventually updated together. Consistency `QUORUM` (2 of 3 replicas) to guarantee durability.
+4. Respond **201**.
+
+The cache is **not warmed** on creation: most links never become hot, and the first click populates the cache.
+
+### Flow 3: Update and delete
+
+1. API Gateway: auth, rate limit.
+2. Link Service checks that the link's `user_id` matches the API key owner; otherwise 404.
+3. Update both Cassandra tables with `QUORUM`.
+4. `DEL link:abc1234` in Redis: the next click reads fresh data from Cassandra.
+5. Browsers pick up the change within ≤ 90 seconds (`max-age`).
+
+This is the **cache-aside** pattern: the application reads the cache, falls back to the database on a miss and invalidates the cache on writes.
+
+### Flow 4: Analytics
+
+1. The Redirect Service publishes `{key, timestamp, ip, user_agent, referrer}` to the Kafka topic `clicks`, **partitioned by `key`** (all clicks of a link go to the same partition).
+2. **Analytics Consumers** read in batches:
+   - IP → country (local GeoIP database);
+   - User-Agent → device type;
+   - **the IP is then discarded**: it is personal data and is not stored without a reason (GDPR).
+3. Events are inserted into ClickHouse in batches of ~10K rows (ClickHouse handles large inserts well and small ones poorly).
+4. **Materialized views** in ClickHouse maintain daily and per-country aggregates; the Stats Service reads those instead of raw events.
+
+Kafka acts as a **buffer**: if ClickHouse is slow or down, events accumulate in Kafka (retained e.g. for 7 days) and are written later. Nothing is lost and redirects are unaffected.
+
+### Flow 5: Expired links
+
+The **Cleanup Worker** runs daily, finds links with `expires_at` in the past and moves them to cheap cold storage (e.g. S3). A **tombstone row** (key + `deleted_at`) stays in Cassandra, so:
+
+- the redirect returns 410, not 404;
+- the key or alias is never reused.
+
+### Consistency Between Stores (Dual Writes)
+
+| Where | Problem | Solution |
+|---|---|---|
+| `links` + `links_by_user` | two tables in one database | logged batch |
+| Create → Redis | none: the cache is populated lazily | — |
+| Clicks → Kafka | no database write involved; losing an event is acceptable | async fire-and-forget |
+| Update/delete → `DEL` in Redis | real dual write: if `DEL` fails, the cache serves the old URL until TTL | retry with backoff + cache TTL capped at 1 hour (or CDC-based invalidation) |
+
+**Transactional outbox is not needed here.** It solves a different problem: an event that **must not be lost** and is produced by a database write (e.g. "link created" for a phishing scanner or billing). If such an event appears, it would be written to an `outbox` table in the same logged batch and relayed to Kafka. With Cassandra, CDC is usually preferred over an outbox table, since processed and deleted rows leave tombstones that slow down reads.
+
+### Open Questions for the Deep Dive
+
+1. **Key Generator:** how to generate unique, unpredictable keys across many servers without per-request coordination? See [Deep Dive: Key Generation](#deep-dive-key-generation).
+2. **Cache:** hot keys (a viral link), cache stampede, the race between invalidation and a concurrent read.
+3. **Rate limiting:** which algorithm, and where to keep counters.
+4. **Multi-region:** what happens if a whole data center goes down?
+
+## Deep Dive: Key Generation
+
+### Requirements
+
+1. **Unique:** two links never share a key.
+2. **7 characters**, base62.
+3. **Unpredictable:** neighboring links cannot be enumerated.
+4. **Fast:** 3K RPS at peak.
+5. **No per-request coordination** between Link Service instances.
+
+### Chosen Approach: Salted Hash + LWT + Retry
+
+```go
+func generateKey(longURL string, attempt int) string {
+    // the salt makes shortening the same URL twice produce different keys (requirement 8)
+    input := fmt.Sprintf("%s|%d|%d", longURL, time.Now().UnixNano(), attempt)
+    sum := sha256.Sum256([]byte(input))
+    n := binary.BigEndian.Uint64(sum[:8]) % 3_521_614_606_208 // 62^7
+    return toBase62(n, 7)
+}
+```
+
+Insertion:
+
+```
+attempt = 0
+loop:
+    key = generateKey(url, attempt)
+    INSERT INTO links ... IF NOT EXISTS
+    if not applied: attempt++, retry (up to ~5 attempts)
+```
+
+**Pros:**
+
+- Simple: one function, no counters or extra infrastructure.
+- Unpredictable: a SHA-256 of a nanosecond-salted input cannot be guessed.
+- No coordination between instances.
+- LWT is needed anyway for custom aliases, so the uniqueness check adds no new mechanism.
+
+**Cons:**
+
+- **Collisions grow over time:** the chance that a new key is taken equals `used / total`, ~1% after a year (36B / 3.5T) and ~6% after 5 years (200B / 3.5T). Each collision costs an extra LWT round-trip.
+- **Every insert is an LWT** (~4× more expensive than a regular write). Acceptable at 1–3K write RPS.
+- Because of the salt, the hash no longer depends only on the URL, so this is effectively a random key: `crypto/rand` would work equally well. The hash is just a source of randomness.
+
+**Why not hash only the URL:** the same URL would always get the same key (breaks requirement 8), and truncating the hash to 7 characters still produces collisions, so a uniqueness check is required anyway.
+
+### Collision with Custom Aliases
+
+Aliases and generated keys share one namespace. A user may pick `hello12`, which is a valid generated key. A plain Cassandra `INSERT` would silently overwrite it, so **every** insert (alias or generated) uses `IF NOT EXISTS`.
+
+### Alternatives Considered
+
+| Approach | Unique | Unpredictable | Coordination | Check on write |
+|---|---|---|---|---|
+| **Salted hash / random (chosen)** | collisions up to ~6% | yes | none | required, with retries |
+| Plain counter + base62 | yes | no | per request | not needed |
+| Counter ranges + Feistel permutation | yes | yes | once per ~17 min | safety-net LWT only |
+| Pre-generated keys (KGS) | yes | yes | per batch | not needed |
+| Snowflake ID | yes | partially | none | — (11 characters in base62, too long) |
+
+**Counter ranges + Feistel permutation** is the main alternative if write volume grows and per-insert LWTs or retries become a problem:
+
+- Each instance reserves a range of IDs from a counter in PostgreSQL (`UPDATE key_counter SET next_id = next_id + 1000000 RETURNING next_id`) and hands them out from memory. At 3K RPS across 3 instances, each instance fetches a new range every ~17 minutes. A lost range after a crash is harmless given the key space.
+- Before base62 encoding, the counter passes through a 40-bit Feistel network with secret round keys. Feistel is a bijection for any round function, so keys stay unique while looking random. 2⁴⁰ ≈ 1.1T fits into 7 base62 characters (62⁷ ≈ 3.5T) and covers the 200B links needed.
+
+**Pre-generated keys (KGS)** produce the same result as counter ranges, but require storing billions of keys and tracking used and unused ones in a separate service.

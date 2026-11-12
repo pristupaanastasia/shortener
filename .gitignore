@@ -1,0 +1,11 @@
+# IDE
+.idea/
+
+# Build output
+/bin/
+
+# Test artifacts
+coverage.out
+
+# Local environment
+.env
