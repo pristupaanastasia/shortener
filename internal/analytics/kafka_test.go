@@ -98,6 +98,7 @@ func publish(t *testing.T, key string, n int) {
 // Regression: stopping while an insert was being retried committed the
 // offsets of the batch that was never stored, losing it.
 func TestStopDuringRetryKeepsEvents(t *testing.T) {
+	t.Parallel() // its own key and consumer group
 	tests := []struct {
 		name   string
 		events int
@@ -146,6 +147,7 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 }
 
 func TestKafkaPipeline(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name         string
 		events       int
@@ -156,6 +158,7 @@ func TestKafkaPipeline(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel() // each case has its own key and consumer group
 			// A unique link key and group per run: the topic keeps old events.
 			key := "it" + strings.ToLower(rand.Text())[:10]
 			group := "it-" + key

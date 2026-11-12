@@ -124,17 +124,20 @@ func TestPublishDoesNotBlock(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			p, err := NewKafkaPublisher(tt.brokers, slog.New(slog.NewTextHandler(io.Discard, nil)))
 			if err != nil {
 				t.Fatal(err)
 			}
+			// Nothing can be delivered: do not wait the production 5s on Close.
+			p.closeTimeout = 100 * time.Millisecond
 			defer func() {
 				done := make(chan struct{})
 				go func() { p.Close(); close(done) }()
 				select {
 				case <-done:
-				case <-time.After(10 * time.Second):
-					t.Error("Close did not return within 10s")
+				case <-time.After(2 * time.Second):
+					t.Error("Close did not return within 2s")
 				}
 			}()
 

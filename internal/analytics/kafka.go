@@ -20,6 +20,8 @@ type KafkaPublisher struct {
 	client  *kgo.Client
 	logger  *slog.Logger
 	dropped atomic.Int64
+	// closeTimeout bounds how long Close waits for buffered events.
+	closeTimeout time.Duration
 }
 
 // NewKafkaPublisher returns a publisher for brokers. It does not wait for
@@ -41,7 +43,7 @@ func NewKafkaPublisher(brokers []string, logger *slog.Logger) (*KafkaPublisher, 
 	if err != nil {
 		return nil, fmt.Errorf("kafka client: %w", err)
 	}
-	return &KafkaPublisher{client: client, logger: logger}, nil
+	return &KafkaPublisher{client: client, logger: logger, closeTimeout: 5 * time.Second}, nil
 }
 
 // Publish implements Publisher. TryProduce returns immediately; delivery
@@ -70,10 +72,10 @@ func (p *KafkaPublisher) drop(err error) {
 // Dropped returns the number of events lost so far.
 func (p *KafkaPublisher) Dropped() int64 { return p.dropped.Load() }
 
-// Close sends buffered events (waiting at most a few seconds) and closes the
+// Close sends buffered events (waiting at most closeTimeout) and closes the
 // client.
 func (p *KafkaPublisher) Close() {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), p.closeTimeout)
 	defer cancel()
 	_ = p.client.Flush(ctx)
 	p.client.Close()
