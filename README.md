@@ -144,7 +144,7 @@ The network is not a bottleneck.
 
   Implementation details:
   - **Fixed window** of one minute, a counter per subject in Redis (`INCR` + `EXPIRE` in one transaction), shared by all instances. The simplest algorithm; the trade-off is a burst of up to 2× the limit around a window boundary.
-  - **Limits:** 100 requests/min per user, 10 requests/min per IP for requests without a valid API key.
+  - **Limits:** 100 requests/min per user, 10 requests/min per IP for requests without a valid API key (configurable with `RATE_LIMIT_USER` and `RATE_LIMIT_ANONYMOUS`).
   - The limit is checked **before** an invalid API key is rejected, so guessing keys counts against the IP quota.
   - The client IP is the TCP peer address. `X-Forwarded-For` is not trusted: behind a load balancer, read only the balancer's own header.
   - If Redis is unavailable, requests are allowed (fail open): rate limiting must not take the API down.
@@ -336,7 +336,7 @@ Authorization: Bearer <api_key>
 }
 ```
 
-`updated_at` is the time of the latest ingested click of the link (`null` if none): analytics is asynchronous (Kafka → ClickHouse), so it shows how fresh the numbers are.
+`updated_at` is the time of the latest ingested click of the link (`null` if none; kept beyond the 90-day retention of raw clicks): analytics is asynchronous (Kafka → ClickHouse), so it shows how fresh the numbers are.
 
 - Days are UTC; `from`/`to` default to the last 30 days, the range is at most 366 days, and only `granularity=day` is supported.
 - Each dimension returns its top 10 values.
@@ -530,15 +530,15 @@ This is the **cache-aside** pattern: the application reads the cache, falls back
 
 ### Flow 4: Analytics
 
-1. The Redirect Service publishes `{key, timestamp, country, user_agent, referrer}` to the Kafka topic `clicks`, **keyed by `key`** (all clicks of a link go to the same partition). Publishing never blocks: events are buffered in memory (up to 100K) and sent in batches; when the buffer is full, new events are dropped and counted.
+1. The Redirect Service publishes `{key, timestamp, country, user_agent, referrer_host}` to the Kafka topic `clicks`, **keyed by `key`** (all clicks of a link go to the same partition). Publishing never blocks: events are buffered in memory (up to 100K events or 64 MB) and sent in batches; when the buffer is full, new events are dropped and counted. Events stay small: only the referrer's host is sent (paths and queries may contain personal data) and the User-Agent is cut to 512 bytes.
    - **No IP address enters the pipeline.** The country comes from a header set by the CDN or load balancer (e.g. Cloudflare's `CF-IPCountry`, configured with `COUNTRY_HEADER`). This avoids storing personal data (GDPR) and needs no GeoIP database. The header is read only when configured, since clients could send it themselves.
 2. **Analytics Consumers** (`cmd/consumer`, scaled independently) read in batches:
    - User-Agent → device type (desktop, mobile, tablet, bot);
-   - Referer → host only (paths and queries may contain personal data);
    - malformed events are logged and skipped, so they cannot block a partition.
 3. Events are inserted into ClickHouse in batches of up to 10K rows or every second (ClickHouse handles large inserts well and small ones poorly).
-   - **At-least-once delivery:** offsets are committed only after a successful insert. A crash between the two re-inserts that batch, so a click can be counted twice; none are lost. Failed inserts are retried with backoff.
-4. **Materialized views** in ClickHouse maintain daily and per-dimension (country, device, referrer) aggregates in `SummingMergeTree` tables; the Stats Service reads those instead of raw events. Raw events are kept for 90 days (TTL), aggregates forever.
+   - **At-least-once delivery:** offsets are committed only after a successful insert. A crash between the two re-inserts that batch, so a click can be counted twice; none are lost. Failed inserts are retried with backoff; if the consumer is stopped during retries, it makes one last attempt and exits with an error **without** committing, so the batch is read again on restart.
+4. **Materialized views** in ClickHouse maintain daily and per-dimension (country, device, referrer) aggregates in `SummingMergeTree` tables, plus the latest click time per link; the Stats Service reads those instead of raw events. Raw events are kept for 90 days (TTL), aggregates forever.
+5. ClickHouse is optional for the redirect service: it connects lazily, so the service starts and keeps redirecting while ClickHouse is down, and `/stats` answers 503 until the connection succeeds.
 
 Kafka acts as a **buffer**: if ClickHouse is slow or down, events accumulate in Kafka (retained e.g. for 7 days) and are written later. Nothing is lost and redirects are unaffected.
 

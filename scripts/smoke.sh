@@ -26,13 +26,18 @@ if [ -n "${SMOKE_COVERDIR:-}" ]; then
 fi
 
 "${build[@]}" -o "$work/shortener" ./cmd/shortener
-ADDR=":$port" BASE_URL="$base" "$work/shortener" >"$log" 2>&1 &
+# Several smoke runs per minute from 127.0.0.1 (the pre-push hook, CI,
+# concurrent runs) would exceed the default anonymous limit of 10/min.
+RATE_LIMIT_ANONYMOUS=1000 ADDR=":$port" BASE_URL="$base" "$work/shortener" >"$log" 2>&1 &
 pid=$!
 consumer_pid=""
 if $analytics; then
 	"${build[@]}" -o "$work/consumer" ./cmd/consumer
-	# A fresh consumer group per run, so old events do not delay this one.
-	KAFKA_GROUP="smoke-$(date +%s)$RANDOM" FLUSH_INTERVAL=200ms "$work/consumer" >"$work/consumer.log" 2>&1 &
+	# One fixed group for all smoke runs: its committed offsets mean each run
+	# processes only new events (a fresh group would re-insert the whole topic
+	# into ClickHouse every time), and concurrent runs share the partitions,
+	# so every event is inserted once.
+	KAFKA_GROUP=smoke FLUSH_INTERVAL=200ms "$work/consumer" >"$work/consumer.log" 2>&1 &
 	consumer_pid=$!
 fi
 trap 'kill "$pid" $consumer_pid 2>/dev/null || true; rm -rf "$work"' EXIT

@@ -36,6 +36,10 @@ type config struct {
 	redisAddr   string // empty: no cache, rate limiting or idempotency
 	postgresDSN string // empty: in-memory accounts
 
+	// Requests per minute; zero means the httpapi defaults.
+	anonymousLimit int
+	userLimit      int
+
 	kafkaBrokers  []string // empty: clicks are not published
 	clickhouseDSN string   // empty: no statistics endpoint
 	countryHeader string   // header with the client's country, set by the edge
@@ -64,6 +68,21 @@ func loadConfig() (config, error) {
 		return config{}, fmt.Errorf("CASSANDRA_REPLICATION_FACTOR: %w", err)
 	}
 	cfg.cassandra.ReplicationFactor = rf
+	for _, limit := range []struct {
+		env string
+		dst *int
+	}{
+		{"RATE_LIMIT_ANONYMOUS", &cfg.anonymousLimit},
+		{"RATE_LIMIT_USER", &cfg.userLimit},
+	} {
+		if v := os.Getenv(limit.env); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 1 {
+				return config{}, fmt.Errorf("%s must be a positive integer", limit.env)
+			}
+			*limit.dst = n
+		}
+	}
 	if brokers := os.Getenv("KAFKA_BROKERS"); brokers != "" {
 		cfg.kafkaBrokers = strings.Split(brokers, ",")
 	}
@@ -136,7 +155,7 @@ func run(logger *slog.Logger) error {
 	}
 	defer closeAccounts()
 
-	api := httpapi.Config{BaseURL: cfg.baseURL, Logger: logger}
+	api := httpapi.Config{BaseURL: cfg.baseURL, Logger: logger, AnonymousLimit: cfg.anonymousLimit, UserLimit: cfg.userLimit}
 	if cfg.redisAddr != "" {
 		rdb := cache.NewRedisClient(cfg.redisAddr)
 		defer rdb.Close()
