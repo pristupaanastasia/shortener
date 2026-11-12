@@ -28,7 +28,8 @@ fi
 "${build[@]}" -o "$work/shortener" ./cmd/shortener
 # Several smoke runs per minute from 127.0.0.1 (the pre-push hook, CI,
 # concurrent runs) would exceed the default anonymous limit of 10/min.
-RATE_LIMIT_ANONYMOUS=1000 ADDR=":$port" BASE_URL="$base" "$work/shortener" >"$log" 2>&1 &
+metrics_port="${SMOKE_METRICS_PORT:-$((port + 1))}"
+RATE_LIMIT_ANONYMOUS=1000 METRICS_ADDR=":$metrics_port" ADDR=":$port" BASE_URL="$base" "$work/shortener" >"$log" 2>&1 &
 pid=$!
 consumer_pid=""
 if $analytics; then
@@ -103,6 +104,8 @@ expect "list without key" 401 "$(status "$base/api/v1/links")"
 expect "delete link" 204 "$(status -X DELETE "$base/api/v1/links/$alias" "${auth[@]}")"
 expect "redirect after delete" 410 "$(status "$base/$alias")"
 expect "unknown key" 404 "$(status "$base/nosuchkey$run")"
+redirects="$(curl -s "http://127.0.0.1:$metrics_port/metrics" | grep -c '^http_requests_total{code="301",method="GET",route="GET /{key}"}' || true)"
+expect "metrics count redirects by route pattern" 1 "$redirects"
 
 kill -INT "$pid"
 code=0

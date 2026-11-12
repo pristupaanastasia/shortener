@@ -13,7 +13,7 @@ func TestLoadConfig(t *testing.T) {
 		check   func(t *testing.T, cfg config)
 	}{
 		{name: "defaults", check: func(t *testing.T, cfg config) {
-			if cfg.addr != ":8080" || cfg.baseURL != "http://localhost:8080" || cfg.storage != "memory" {
+			if cfg.addr != ":8080" || cfg.metricsAddr != ":9091" || cfg.baseURL != "http://localhost:8080" || cfg.storage != "memory" {
 				t.Errorf("cfg = %+v", cfg)
 			}
 			if cfg.cassandra.Keyspace != "shortener" || cfg.cassandra.ReplicationFactor != 1 || len(cfg.cassandra.Hosts) != 1 {
@@ -55,7 +55,7 @@ func TestLoadConfig(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			for _, k := range []string{"ADDR", "BASE_URL", "STORAGE", "CASSANDRA_HOSTS", "CASSANDRA_KEYSPACE", "CASSANDRA_REPLICATION_FACTOR", "REDIS_ADDR", "POSTGRES_DSN", "KAFKA_BROKERS", "CLICKHOUSE_DSN", "COUNTRY_HEADER", "RATE_LIMIT_ANONYMOUS", "RATE_LIMIT_USER"} {
+			for _, k := range []string{"ADDR", "METRICS_ADDR", "BASE_URL", "STORAGE", "CASSANDRA_HOSTS", "CASSANDRA_KEYSPACE", "CASSANDRA_REPLICATION_FACTOR", "REDIS_ADDR", "POSTGRES_DSN", "KAFKA_BROKERS", "CLICKHOUSE_DSN", "COUNTRY_HEADER", "RATE_LIMIT_ANONYMOUS", "RATE_LIMIT_USER"} {
 				t.Setenv(k, tt.env[k])
 			}
 			cfg, err := loadConfig()

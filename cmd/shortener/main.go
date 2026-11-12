@@ -21,15 +21,19 @@ import (
 	"github.com/pristupaanastasia/shortener/internal/httpapi"
 	"github.com/pristupaanastasia/shortener/internal/idempotency"
 	"github.com/pristupaanastasia/shortener/internal/link"
+	"github.com/pristupaanastasia/shortener/internal/metrics"
 	"github.com/pristupaanastasia/shortener/internal/ratelimit"
 	"github.com/pristupaanastasia/shortener/internal/storage/cassandra"
 	"github.com/pristupaanastasia/shortener/internal/storage/clickhouse"
 	"github.com/pristupaanastasia/shortener/internal/storage/memory"
 	"github.com/pristupaanastasia/shortener/internal/storage/postgres"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 type config struct {
 	addr        string
+	metricsAddr string // empty: no metrics endpoint
 	baseURL     string
 	storage     string
 	cassandra   cassandra.Config
@@ -48,6 +52,7 @@ type config struct {
 func loadConfig() (config, error) {
 	cfg := config{
 		addr:        getenv("ADDR", ":8080"),
+		metricsAddr: getenv("METRICS_ADDR", ":9091"),
 		baseURL:     getenv("BASE_URL", "http://localhost:8080"),
 		storage:     getenv("STORAGE", "memory"),
 		redisAddr:   os.Getenv("REDIS_ADDR"),
@@ -155,11 +160,14 @@ func run(logger *slog.Logger) error {
 	}
 	defer closeAccounts()
 
+	m := metrics.New()
 	api := httpapi.Config{BaseURL: cfg.baseURL, Logger: logger, AnonymousLimit: cfg.anonymousLimit, UserLimit: cfg.userLimit}
 	if cfg.redisAddr != "" {
 		rdb := cache.NewRedisClient(cfg.redisAddr)
 		defer rdb.Close()
-		cached := cache.New(store, rdb, cache.DefaultConfig(), logger)
+		cacheCfg := cache.DefaultConfig()
+		cacheCfg.OnLookup = m.CacheLookup
+		cached := cache.New(store, rdb, cacheCfg, logger)
 		// Redis is optional at runtime, so an unreachable one is only a warning.
 		if err := cached.Ping(ctx); err != nil {
 			logger.Warn("redis unavailable, serving from storage until it recovers", "err", err)
@@ -180,6 +188,10 @@ func run(logger *slog.Logger) error {
 		}
 		defer publisher.Close() // after the server has stopped: flushes buffered clicks
 		api.Clicks = publisher
+		m.Register(prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Name: "clicks_dropped_total",
+			Help: "Click events lost because Kafka was unavailable or the buffer was full.",
+		}, func() float64 { return float64(publisher.Dropped()) }))
 		api.CountryHeader = cfg.countryHeader
 	}
 	if cfg.clickhouseDSN != "" {
@@ -195,7 +207,7 @@ func run(logger *slog.Logger) error {
 
 	srv := &http.Server{
 		Addr:              cfg.addr,
-		Handler:           httpapi.New(api),
+		Handler:           m.Middleware(httpapi.New(api)),
 		ReadHeaderTimeout: 5 * time.Second,
 		MaxHeaderBytes:    64 << 10,
 		ReadTimeout:       10 * time.Second,
@@ -203,7 +215,20 @@ func run(logger *slog.Logger) error {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	errc := make(chan error, 1)
+	errc := make(chan error, 2)
+	// Metrics are served on a separate port, so they are not exposed with
+	// the public API.
+	var metricsSrv *http.Server
+	if cfg.metricsAddr != "" {
+		mux := http.NewServeMux()
+		mux.Handle("GET /metrics", m.Handler())
+		metricsSrv = &http.Server{Addr: cfg.metricsAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+		go func() {
+			if err := metricsSrv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+				errc <- fmt.Errorf("metrics server: %w", err)
+			}
+		}()
+	}
 	go func() {
 		logger.Info("listening", "addr", cfg.addr, "base_url", cfg.baseURL, "storage", cfg.storage, "redis", cfg.redisAddr != "", "postgres", cfg.postgresDSN != "",
 			"kafka", len(cfg.kafkaBrokers) > 0, "clickhouse", cfg.clickhouseDSN != "")
@@ -221,6 +246,9 @@ func run(logger *slog.Logger) error {
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("shutdown: %w", err)
+	}
+	if metricsSrv != nil {
+		_ = metricsSrv.Shutdown(shutdownCtx)
 	}
 	if err := <-errc; !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("listen: %w", err)

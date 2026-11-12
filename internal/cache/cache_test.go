@@ -296,3 +296,35 @@ func TestRedisDown(t *testing.T) {
 		})
 	}
 }
+
+func TestOnLookup(t *testing.T) {
+	tests := []struct {
+		name   string
+		before func(mr *miniredis.Miniredis, c *Store)
+		want   string
+	}{
+		{name: "first read comes from the store", want: "store"},
+		{name: "then from l1", before: func(_ *miniredis.Miniredis, c *Store) { _, _ = c.Get(context.Background(), "abc1234") }, want: "l1"},
+		{name: "redis when l1 is empty", before: func(_ *miniredis.Miniredis, c *Store) {
+			_, _ = c.Get(context.Background(), "abc1234")
+			c.l1.Purge()
+		}, want: "redis"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var levels []string
+			cfg := DefaultConfig()
+			cfg.OnLookup = func(level string) { levels = append(levels, level) }
+			c, backing, mr := newTestCache(t, cfg)
+			mustCreate(t, backing.Store, link.Link{Key: "abc1234", LongURL: "https://example.com"})
+			if tt.before != nil {
+				tt.before(mr, c)
+			}
+			levels = nil
+			_, _ = c.Get(context.Background(), "abc1234")
+			if len(levels) != 1 || levels[0] != tt.want {
+				t.Errorf("OnLookup levels = %v, want [%s]", levels, tt.want)
+			}
+		})
+	}
+}
