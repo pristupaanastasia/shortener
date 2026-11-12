@@ -82,51 +82,72 @@ func TestCreateValidation(t *testing.T) {
 	}
 }
 
-func TestCreateAliasTaken(t *testing.T) {
+func TestCreateAlias(t *testing.T) {
 	ctx := context.Background()
 	s := newTestService(mapStore{})
 	p := CreateParams{LongURL: "https://example.com", Alias: "sale2026"}
 
-	l, err := s.Create(ctx, p)
-	if err != nil {
-		t.Fatalf("first create: %v", err)
+	steps := []struct {
+		name    string
+		wantKey string
+		wantErr error
+	}{
+		{name: "first create uses the alias", wantKey: "sale2026"},
+		{name: "second create is a conflict", wantErr: ErrAliasTaken},
 	}
-	if l.Key != "sale2026" {
-		t.Errorf("Key = %q, want alias", l.Key)
-	}
-	if _, err := s.Create(ctx, p); !errors.Is(err, ErrAliasTaken) {
-		t.Errorf("second create: err = %v, want ErrAliasTaken", err)
-	}
-}
-
-func TestCreateRetriesOnCollision(t *testing.T) {
-	store := mapStore{"taken01": {Key: "taken01"}, "taken02": {Key: "taken02"}}
-	s := newTestService(store)
-	candidates := []string{"taken01", "taken02", "fresh01"}
-	s.generate = func(_ string, _ time.Time, attempt int) string { return candidates[attempt] }
-
-	l, err := s.Create(context.Background(), CreateParams{LongURL: "https://example.com"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	if l.Key != "fresh01" {
-		t.Errorf("Key = %q, want fresh01", l.Key)
+	for _, step := range steps {
+		ok := t.Run(step.name, func(t *testing.T) {
+			l, err := s.Create(ctx, p)
+			if !errors.Is(err, step.wantErr) {
+				t.Fatalf("Create(%+v) err = %v, want %v", p, err, step.wantErr)
+			}
+			if l.Key != step.wantKey {
+				t.Errorf("Key = %q, want %q", l.Key, step.wantKey)
+			}
+		})
+		if !ok {
+			break
+		}
 	}
 }
 
-func TestCreateGivesUpAfterMaxAttempts(t *testing.T) {
-	s := newTestService(mapStore{"taken01": {Key: "taken01"}})
-	attempts := 0
-	s.generate = func(string, time.Time, int) string {
-		attempts++
-		return "taken01"
+func TestCreateKeyCollisions(t *testing.T) {
+	tests := []struct {
+		name         string
+		taken        []string
+		candidates   []string // returned by the generator for each attempt
+		wantKey      string
+		wantErr      bool
+		wantAttempts int
+	}{
+		{name: "free on first attempt", candidates: []string{"fresh01"}, wantKey: "fresh01", wantAttempts: 1},
+		{name: "retries past collisions", taken: []string{"taken01", "taken02"}, candidates: []string{"taken01", "taken02", "fresh01"}, wantKey: "fresh01", wantAttempts: 3},
+		{name: "gives up after max attempts", taken: []string{"taken01"}, candidates: []string{"taken01"}, wantErr: true, wantAttempts: maxKeyAttempts},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := mapStore{}
+			for _, k := range tt.taken {
+				store[k] = Link{Key: k}
+			}
+			s := newTestService(store)
+			attempts := 0
+			s.generate = func(_ string, _ time.Time, attempt int) string {
+				attempts++
+				return tt.candidates[min(attempt, len(tt.candidates)-1)]
+			}
 
-	if _, err := s.Create(context.Background(), CreateParams{LongURL: "https://example.com"}); err == nil {
-		t.Fatal("Create succeeded, want error")
-	}
-	if attempts != maxKeyAttempts {
-		t.Errorf("attempts = %d, want %d", attempts, maxKeyAttempts)
+			l, err := s.Create(context.Background(), CreateParams{LongURL: "https://example.com"})
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Create err = %v, want error: %v", err, tt.wantErr)
+			}
+			if l.Key != tt.wantKey {
+				t.Errorf("Key = %q, want %q", l.Key, tt.wantKey)
+			}
+			if attempts != tt.wantAttempts {
+				t.Errorf("attempts = %d, want %d", attempts, tt.wantAttempts)
+			}
+		})
 	}
 }
 
@@ -138,20 +159,21 @@ func TestResolve(t *testing.T) {
 		"deleted": {Key: "deleted", LongURL: "https://example.com", DeletedAt: ptr(testNow.Add(-time.Hour))},
 	}
 	tests := []struct {
+		name    string
 		key     string
 		wantErr error
 	}{
-		{"active1", nil},
-		{"future1", nil},
-		{"expired", ErrGone},
-		{"deleted", ErrGone},
-		{"missing", ErrNotFound},
+		{name: "permanent link", key: "active1", wantErr: nil},
+		{name: "expires later", key: "future1", wantErr: nil},
+		{name: "expires exactly now", key: "expired", wantErr: ErrGone},
+		{name: "deleted", key: "deleted", wantErr: ErrGone},
+		{name: "missing", key: "missing", wantErr: ErrNotFound},
 	}
 	for _, tt := range tests {
-		t.Run(tt.key, func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
 			_, err := newTestService(store).Resolve(context.Background(), tt.key)
 			if !errors.Is(err, tt.wantErr) {
-				t.Errorf("err = %v, want %v", err, tt.wantErr)
+				t.Errorf("Resolve(%q) err = %v, want %v", tt.key, err, tt.wantErr)
 			}
 		})
 	}
@@ -172,59 +194,68 @@ func ownershipStore() mapStore {
 
 func TestGetOwnership(t *testing.T) {
 	tests := []struct {
-		name, user, key string
-		wantErr         error
+		name    string
+		user    string
+		key     string
+		wantErr error
 	}{
-		{"owner", alice, "alice01", nil},
-		{"other user", bob, "alice01", ErrNotFound},
-		{"no user", "", "alice01", ErrNotFound},
-		{"anonymous link", alice, "anon001", ErrNotFound},
-		{"deleted link", alice, "gone001", ErrNotFound},
-		{"missing", alice, "missing", ErrNotFound},
+		{name: "owner", user: alice, key: "alice01", wantErr: nil},
+		{name: "other user", user: bob, key: "alice01", wantErr: ErrNotFound},
+		{name: "no user", user: "", key: "alice01", wantErr: ErrNotFound},
+		{name: "anonymous link", user: alice, key: "anon001", wantErr: ErrNotFound},
+		{name: "deleted link", user: alice, key: "gone001", wantErr: ErrNotFound},
+		{name: "missing", user: alice, key: "missing", wantErr: ErrNotFound},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := newTestService(ownershipStore()).Get(context.Background(), tt.user, tt.key)
 			if !errors.Is(err, tt.wantErr) {
-				t.Errorf("err = %v, want %v", err, tt.wantErr)
+				t.Errorf("Get(%q, %q) err = %v, want %v", tt.user, tt.key, err, tt.wantErr)
 			}
 		})
 	}
 }
 
 func TestUpdate(t *testing.T) {
-	ctx := context.Background()
-	store := ownershipStore()
-	s := newTestService(store)
-
 	newURL := "https://example.com/new"
-	expires := testNow.Add(time.Hour)
-	l, err := s.Update(ctx, alice, "alice01", UpdateParams{LongURL: &newURL, SetExpiresAt: true, ExpiresAt: &expires})
-	if err != nil {
-		t.Fatalf("Update: %v", err)
-	}
-	if l.LongURL != newURL || store["alice01"].LongURL != newURL || !store["alice01"].ExpiresAt.Equal(expires) {
-		t.Errorf("link not updated: returned %+v, stored %+v", l, store["alice01"])
-	}
-
-	// Clearing the expiration makes the link permanent; the URL stays.
-	if _, err := s.Update(ctx, alice, "alice01", UpdateParams{SetExpiresAt: true}); err != nil {
-		t.Fatalf("Update: %v", err)
-	}
-	if store["alice01"].ExpiresAt != nil || store["alice01"].LongURL != newURL {
-		t.Errorf("stored %+v, want permanent link to %s", store["alice01"], newURL)
-	}
-
-	if _, err := s.Update(ctx, bob, "alice01", UpdateParams{LongURL: &newURL}); !errors.Is(err, ErrNotFound) {
-		t.Errorf("other user: err = %v, want ErrNotFound", err)
-	}
 	bad := "ftp://example.com"
-	if _, err := s.Update(ctx, alice, "alice01", UpdateParams{LongURL: &bad}); !errors.Is(err, ErrInvalidURL) {
-		t.Errorf("invalid url: err = %v, want ErrInvalidURL", err)
-	}
+	expires := testNow.Add(time.Hour)
 	past := testNow.Add(-time.Hour)
-	if _, err := s.Update(ctx, alice, "alice01", UpdateParams{SetExpiresAt: true, ExpiresAt: &past}); !errors.Is(err, ErrInvalidExpiry) {
-		t.Errorf("past expiry: err = %v, want ErrInvalidExpiry", err)
+	original := ownershipStore()["alice01"]
+
+	tests := []struct {
+		name        string
+		user        string
+		params      UpdateParams
+		wantErr     error
+		wantURL     string     // stored long_url after the call
+		wantExpires *time.Time // stored expires_at after the call
+	}{
+		{name: "url and expiry", user: alice, params: UpdateParams{LongURL: &newURL, SetExpiresAt: true, ExpiresAt: &expires}, wantURL: newURL, wantExpires: &expires},
+		{name: "url only keeps expiry", user: alice, params: UpdateParams{LongURL: &newURL}, wantURL: newURL},
+		{name: "null expiry makes the link permanent", user: alice, params: UpdateParams{SetExpiresAt: true}, wantURL: original.LongURL},
+		{name: "other user", user: bob, params: UpdateParams{LongURL: &newURL}, wantErr: ErrNotFound, wantURL: original.LongURL},
+		{name: "invalid url", user: alice, params: UpdateParams{LongURL: &bad}, wantErr: ErrInvalidURL, wantURL: original.LongURL},
+		{name: "expiry in past", user: alice, params: UpdateParams{SetExpiresAt: true, ExpiresAt: &past}, wantErr: ErrInvalidExpiry, wantURL: original.LongURL},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := ownershipStore()
+			l, err := newTestService(store).Update(context.Background(), tt.user, "alice01", tt.params)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("Update err = %v, want %v", err, tt.wantErr)
+			}
+			stored := store["alice01"]
+			if stored.LongURL != tt.wantURL {
+				t.Errorf("stored LongURL = %q, want %q", stored.LongURL, tt.wantURL)
+			}
+			if (stored.ExpiresAt == nil) != (tt.wantExpires == nil) || (tt.wantExpires != nil && !stored.ExpiresAt.Equal(*tt.wantExpires)) {
+				t.Errorf("stored ExpiresAt = %v, want %v", stored.ExpiresAt, tt.wantExpires)
+			}
+			if err == nil && l.LongURL != stored.LongURL {
+				t.Errorf("returned LongURL = %q, stored %q", l.LongURL, stored.LongURL)
+			}
+		})
 	}
 }
 
@@ -233,22 +264,41 @@ func TestDelete(t *testing.T) {
 	store := ownershipStore()
 	s := newTestService(store)
 
-	if err := s.Delete(ctx, bob, "alice01"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("other user: err = %v, want ErrNotFound", err)
+	steps := []struct {
+		name    string
+		user    string
+		key     string
+		wantErr error
+		check   func(t *testing.T)
+	}{
+		{name: "other user cannot delete", user: bob, key: "alice01", wantErr: ErrNotFound, check: func(t *testing.T) {
+			if store["alice01"].DeletedAt != nil {
+				t.Error("link was deleted by another user")
+			}
+		}},
+		{name: "owner deletes", user: alice, key: "alice01", check: func(t *testing.T) {
+			if store["alice01"].DeletedAt == nil {
+				t.Fatal("link was not soft-deleted")
+			}
+			if _, err := s.Resolve(ctx, "alice01"); !errors.Is(err, ErrGone) {
+				t.Errorf("Resolve after delete err = %v, want ErrGone", err)
+			}
+		}},
+		{name: "repeated delete is idempotent", user: alice, key: "alice01"},
+		{name: "anonymous link", user: alice, key: "anon001", wantErr: ErrNotFound},
+		{name: "missing link", user: alice, key: "missing", wantErr: ErrNotFound},
 	}
-	if err := s.Delete(ctx, alice, "alice01"); err != nil {
-		t.Fatalf("Delete: %v", err)
-	}
-	if store["alice01"].DeletedAt == nil {
-		t.Fatal("link was not soft-deleted")
-	}
-	if _, err := s.Resolve(ctx, "alice01"); !errors.Is(err, ErrGone) {
-		t.Errorf("Resolve after delete: err = %v, want ErrGone", err)
-	}
-	if err := s.Delete(ctx, alice, "alice01"); err != nil {
-		t.Errorf("repeated Delete: err = %v, want nil (idempotent)", err)
-	}
-	if err := s.Delete(ctx, alice, "anon001"); !errors.Is(err, ErrNotFound) {
-		t.Errorf("anonymous link: err = %v, want ErrNotFound", err)
+	for _, step := range steps {
+		ok := t.Run(step.name, func(t *testing.T) {
+			if err := s.Delete(ctx, step.user, step.key); !errors.Is(err, step.wantErr) {
+				t.Fatalf("Delete(%q, %q) err = %v, want %v", step.user, step.key, err, step.wantErr)
+			}
+			if step.check != nil {
+				step.check(t)
+			}
+		})
+		if !ok {
+			break
+		}
 	}
 }

@@ -13,7 +13,8 @@ URL shortener in Go, built as a learning project for system design and agentic d
 - `make test`: tests only.
 - `make test-integration`: unit + integration tests (`integration` build tag); needs `make up`. Run it before committing changes to storage, caches or queues.
 - `make run`: start the service locally.
-- `make hooks`: enable the git `pre-push` hook (lint + tests; integration tests too when `make up` is running). Run once per clone.
+- `make coverage`: unit + integration tests with a total coverage minimum of 80% (`COVERAGE_MIN`); needs `make up`.
+- `make hooks`: enable the git `pre-push` hook: lint + `make coverage` for every pushed commit, so pushing requires `make up`. Run once per clone.
 - `make up` / `make down`: start/stop infrastructure from `docker-compose.yml` (from M2 on).
 
 ## Project Layout

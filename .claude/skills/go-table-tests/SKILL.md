@@ -73,6 +73,8 @@ func TestDeleteFlow(t *testing.T) {
 
 Here the slice is `steps` and the loop variable `step`, so a reader sees at once that order matters. Do not use `t.Parallel()` in step tests.
 
+When several tests in a package share the same step shape, the loop may live in one helper (e.g. `runAPISteps(t, h, steps)` in `httpapi`), and each test passes it a literal slice of steps. The test still reads as data; the loop exists once instead of being copied into every test.
+
 ## Concurrency, timing and other special checks
 
 Parameterize them the same way: the slice holds the parameters (number of goroutines, delays, which dependency is down), the loop body runs the scenario.

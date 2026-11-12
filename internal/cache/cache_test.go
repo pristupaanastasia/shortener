@@ -41,115 +41,160 @@ func newTestCache(t *testing.T, cfg Config) (*Store, *countingStore, *miniredis.
 	return New(backing, rdb, cfg, logger), backing, mr
 }
 
-func mustCreate(t *testing.T, s link.Store, key, url string) {
+func mustCreate(t *testing.T, s link.Store, l link.Link) {
 	t.Helper()
-	if err := s.Create(context.Background(), link.Link{Key: key, LongURL: url}); err != nil {
+	if err := s.Create(context.Background(), l); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func mustGet(t *testing.T, s link.Store, key string) link.Link {
+// step is a cache lookup with the expected result and store reads so far.
+type step struct {
+	name      string
+	before    func() // e.g. let L1 expire, flush Redis
+	key       string
+	wantURL   string
+	wantErr   error
+	wantReads int32
+}
+
+func runSteps(t *testing.T, c link.Store, backing *countingStore, steps []step) {
 	t.Helper()
-	l, err := s.Get(context.Background(), key)
-	if err != nil {
-		t.Fatalf("Get(%q): %v", key, err)
+	for _, step := range steps {
+		ok := t.Run(step.name, func(t *testing.T) {
+			if step.before != nil {
+				step.before()
+			}
+			l, err := c.Get(context.Background(), step.key)
+			if !errors.Is(err, step.wantErr) {
+				t.Fatalf("Get(%q) err = %v, want %v", step.key, err, step.wantErr)
+			}
+			if l.LongURL != step.wantURL {
+				t.Errorf("Get(%q) LongURL = %q, want %q", step.key, l.LongURL, step.wantURL)
+			}
+			if got := backing.gets.Load(); got != step.wantReads {
+				t.Errorf("store reads = %d, want %d", got, step.wantReads)
+			}
+		})
+		if !ok {
+			break
+		}
 	}
-	return l
 }
 
 func TestGetReadsThroughLevels(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.L1TTL = 50 * time.Millisecond
 	c, backing, mr := newTestCache(t, cfg)
-	mustCreate(t, backing.Store, "abc1234", "https://example.com")
+	mustCreate(t, backing.Store, link.Link{Key: "abc1234", LongURL: "https://example.com"})
+	expireL1 := func() { time.Sleep(100 * time.Millisecond) }
 
-	// Miss: read from the store, populate Redis and L1.
-	if got := mustGet(t, c, "abc1234"); got.LongURL != "https://example.com" {
-		t.Fatalf("LongURL = %q", got.LongURL)
+	runSteps(t, c, backing, []step{
+		{name: "miss reads the store", key: "abc1234", wantURL: "https://example.com", wantReads: 1},
+		{name: "l1 hit", key: "abc1234", wantURL: "https://example.com", wantReads: 1},
+		{name: "l1 expired, redis hit", before: expireL1, key: "abc1234", wantURL: "https://example.com", wantReads: 1},
+		{name: "redis flushed, store read again", before: func() { mr.FlushAll(); expireL1() }, key: "abc1234", wantURL: "https://example.com", wantReads: 2},
+	})
+}
+
+func TestNegativeCaching(t *testing.T) {
+	c, backing, _ := newTestCache(t, DefaultConfig())
+
+	runSteps(t, c, backing, []step{
+		{name: "first miss reads the store", key: "sale2026", wantErr: link.ErrNotFound, wantReads: 1},
+		{name: "second miss is cached", key: "sale2026", wantErr: link.ErrNotFound, wantReads: 1},
+		{name: "third miss is cached", key: "sale2026", wantErr: link.ErrNotFound, wantReads: 1},
+		{
+			name:   "create drops the negative entry",
+			before: func() { mustCreate(t, c, link.Link{Key: "sale2026", LongURL: "https://example.com/sale"}) },
+			key:    "sale2026", wantURL: "https://example.com/sale", wantReads: 2,
+		},
+	})
+}
+
+func TestCachedExpiredLinkStaysExpired(t *testing.T) {
+	c, backing, _ := newTestCache(t, DefaultConfig())
+	past := time.Now().Add(-time.Hour)
+	mustCreate(t, backing.Store, link.Link{Key: "old1234", LongURL: "https://example.com", ExpiresAt: &past})
+	svc := link.NewService(c, "sho.rt")
+
+	tests := []struct {
+		name      string
+		wantReads int32
+	}{
+		{name: "first resolve reads the store", wantReads: 1},
+		{name: "second resolve serves 410 from cache", wantReads: 1},
 	}
-	if !mr.Exists("link:abc1234") {
-		t.Fatal("entry was not written to Redis")
-	}
-
-	// L1 hit.
-	mustGet(t, c, "abc1234")
-
-	// L1 expired: Redis hit.
-	time.Sleep(100 * time.Millisecond)
-	mustGet(t, c, "abc1234")
-
-	// Redis gone too: back to the store.
-	mr.FlushAll()
-	time.Sleep(100 * time.Millisecond)
-	mustGet(t, c, "abc1234")
-
-	if got := backing.gets.Load(); got != 2 {
-		t.Errorf("store reads = %d, want 2 (first miss and after Redis flush)", got)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := svc.Resolve(context.Background(), "old1234"); !errors.Is(err, link.ErrGone) {
+				t.Fatalf("Resolve err = %v, want ErrGone", err)
+			}
+			if got := backing.gets.Load(); got != tt.wantReads {
+				t.Errorf("store reads = %d, want %d", got, tt.wantReads)
+			}
+		})
 	}
 }
 
-func TestRedisTTLHasJitter(t *testing.T) {
-	c, backing, mr := newTestCache(t, DefaultConfig())
-	mustCreate(t, backing.Store, "abc1234", "https://example.com")
-	mustGet(t, c, "abc1234")
-
-	ttl := mr.TTL("link:abc1234")
-	if ttl < time.Hour || ttl >= time.Hour+10*time.Minute {
-		t.Errorf("TTL = %v, want within [1h, 1h10m)", ttl)
+func TestRedisTTL(t *testing.T) {
+	tests := []struct {
+		name    string
+		key     string
+		exists  bool
+		wantMin time.Duration
+		wantMax time.Duration // exclusive
+	}{
+		{name: "found link: 1h plus jitter", key: "abc1234", exists: true, wantMin: time.Hour, wantMax: time.Hour + 10*time.Minute},
+		{name: "missing link: negative ttl", key: "missing", exists: false, wantMin: time.Minute, wantMax: time.Minute + time.Nanosecond},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, backing, mr := newTestCache(t, DefaultConfig())
+			if tt.exists {
+				mustCreate(t, backing.Store, link.Link{Key: tt.key, LongURL: "https://example.com"})
+			}
+			_, _ = c.Get(context.Background(), tt.key)
+			if ttl := mr.TTL(redisKey(tt.key)); ttl < tt.wantMin || ttl >= tt.wantMax {
+				t.Errorf("TTL = %v, want within [%v, %v)", ttl, tt.wantMin, tt.wantMax)
+			}
+		})
 	}
 }
 
 func TestConcurrentMissesReadStoreOnce(t *testing.T) {
-	c, backing, _ := newTestCache(t, DefaultConfig())
-	mustCreate(t, backing.Store, "hot1234", "https://example.com/viral")
-	backing.release = make(chan struct{})
+	tests := []struct {
+		name       string
+		goroutines int
+		wantReads  int32
+	}{
+		{name: "single caller", goroutines: 1, wantReads: 1},
+		{name: "100 concurrent misses share one read", goroutines: 100, wantReads: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, backing, _ := newTestCache(t, DefaultConfig())
+			mustCreate(t, backing.Store, link.Link{Key: "hot1234", LongURL: "https://example.com/viral"})
+			backing.release = make(chan struct{})
 
-	const n = 100
-	var wg sync.WaitGroup
-	for range n {
-		wg.Go(func() {
-			if got := mustGet(t, c, "hot1234"); got.LongURL != "https://example.com/viral" {
-				t.Errorf("LongURL = %q", got.LongURL)
+			var wg sync.WaitGroup
+			for range tt.goroutines {
+				wg.Go(func() {
+					l, err := c.Get(context.Background(), "hot1234")
+					if err != nil || l.LongURL != "https://example.com/viral" {
+						t.Errorf("Get = %+v, %v", l, err)
+					}
+				})
+			}
+			// Let every goroutine reach the miss path, then finish the read.
+			time.Sleep(100 * time.Millisecond)
+			close(backing.release)
+			wg.Wait()
+
+			if got := backing.gets.Load(); got != tt.wantReads {
+				t.Errorf("store reads = %d, want %d", got, tt.wantReads)
 			}
 		})
-	}
-	// Give all goroutines time to reach the miss path, then let the read finish.
-	time.Sleep(100 * time.Millisecond)
-	close(backing.release)
-	wg.Wait()
-
-	if got := backing.gets.Load(); got != 1 {
-		t.Errorf("store reads = %d, want 1", got)
-	}
-}
-
-func TestNegativeCaching(t *testing.T) {
-	c, backing, mr := newTestCache(t, DefaultConfig())
-	ctx := context.Background()
-
-	for range 3 {
-		if _, err := c.Get(ctx, "missing"); !errors.Is(err, link.ErrNotFound) {
-			t.Fatalf("err = %v, want ErrNotFound", err)
-		}
-	}
-	if got := backing.gets.Load(); got != 1 {
-		t.Errorf("store reads = %d, want 1", got)
-	}
-	if ttl := mr.TTL("link:missing"); ttl != time.Minute {
-		t.Errorf("negative TTL = %v, want 1m", ttl)
-	}
-}
-
-func TestCreateDropsNegativeEntry(t *testing.T) {
-	c, _, _ := newTestCache(t, DefaultConfig())
-	ctx := context.Background()
-
-	if _, err := c.Get(ctx, "sale2026"); !errors.Is(err, link.ErrNotFound) {
-		t.Fatalf("err = %v, want ErrNotFound", err)
-	}
-	mustCreate(t, c, "sale2026", "https://example.com/sale")
-	if got := mustGet(t, c, "sale2026"); got.LongURL != "https://example.com/sale" {
-		t.Errorf("LongURL = %q: a stale negative entry was served", got.LongURL)
 	}
 }
 
@@ -157,58 +202,97 @@ func TestInvalidateDelayedDoubleDelete(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.InvalidateDelay = 50 * time.Millisecond
 	c, backing, mr := newTestCache(t, cfg)
-	mustCreate(t, backing.Store, "abc1234", "https://example.com/old")
-	mustGet(t, c, "abc1234")
-	stale, err := mr.Get("link:abc1234")
-	if err != nil {
-		t.Fatal(err)
-	}
+	mustCreate(t, backing.Store, link.Link{Key: "abc1234", LongURL: "https://example.com/old"})
+	key := redisKey("abc1234")
+	var stale string
 
-	c.Invalidate(context.Background(), "abc1234")
-	if mr.Exists("link:abc1234") {
-		t.Fatal("first delete did not remove the Redis entry")
+	steps := []struct {
+		name       string
+		action     func(t *testing.T)
+		wantCached bool
+	}{
+		{name: "read caches the link", wantCached: true, action: func(t *testing.T) {
+			if _, err := c.Get(context.Background(), "abc1234"); err != nil {
+				t.Fatal(err)
+			}
+			stale, _ = mr.Get(key)
+		}},
+		{name: "first delete removes it", wantCached: false, action: func(*testing.T) {
+			c.Invalidate(context.Background(), "abc1234")
+		}},
+		{name: "a racing reader writes the stale value back", wantCached: true, action: func(t *testing.T) {
+			if err := mr.Set(key, stale); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "second delete removes the stale value", wantCached: false, action: func(*testing.T) {
+			time.Sleep(3 * cfg.InvalidateDelay)
+		}},
 	}
-
-	// A concurrent reader that loaded the old value before the store was
-	// updated writes it back after the first delete.
-	if err := mr.Set("link:abc1234", stale); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(150 * time.Millisecond)
-	if mr.Exists("link:abc1234") {
-		t.Error("second delete did not remove the stale entry")
-	}
-}
-
-func TestRedisDownFallsBackToStore(t *testing.T) {
-	c, backing, mr := newTestCache(t, DefaultConfig())
-	mustCreate(t, backing.Store, "abc1234", "https://example.com")
-	mr.Close()
-
-	start := time.Now()
-	if got := mustGet(t, c, "abc1234"); got.LongURL != "https://example.com" {
-		t.Errorf("LongURL = %q", got.LongURL)
-	}
-	// The redirect latency budget is 100 ms; an unavailable cache must not eat it.
-	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
-		t.Errorf("Get with Redis down took %v, want < 200ms", elapsed)
-	}
-	mustCreate(t, c, "new1234", "https://example.com/new")
-}
-
-func TestCachedExpiredLinkStaysExpired(t *testing.T) {
-	c, backing, _ := newTestCache(t, DefaultConfig())
-	past := time.Now().Add(-time.Hour)
-	if err := backing.Store.Create(context.Background(), link.Link{Key: "old1234", LongURL: "https://example.com", ExpiresAt: &past}); err != nil {
-		t.Fatal(err)
-	}
-	svc := link.NewService(c, "sho.rt")
-	for range 2 {
-		if _, err := svc.Resolve(context.Background(), "old1234"); !errors.Is(err, link.ErrGone) {
-			t.Fatalf("err = %v, want ErrGone", err)
+	for _, step := range steps {
+		ok := t.Run(step.name, func(t *testing.T) {
+			step.action(t)
+			if got := mr.Exists(key); got != step.wantCached {
+				t.Fatalf("cached in Redis = %v, want %v", got, step.wantCached)
+			}
+		})
+		if !ok {
+			break
 		}
 	}
-	if got := backing.gets.Load(); got != 1 {
-		t.Errorf("store reads = %d, want 1 (410 served from cache)", got)
+}
+
+func TestUpdateInvalidates(t *testing.T) {
+	c, backing, _ := newTestCache(t, DefaultConfig())
+	mustCreate(t, backing.Store, link.Link{Key: "abc1234", LongURL: "https://example.com/old"})
+
+	runSteps(t, c, backing, []step{
+		{name: "cached before update", key: "abc1234", wantURL: "https://example.com/old", wantReads: 1},
+		{
+			name: "update through the cache is visible at once",
+			before: func() {
+				if err := c.Update(context.Background(), link.Link{Key: "abc1234", LongURL: "https://example.com/new"}); err != nil {
+					t.Fatal(err)
+				}
+			},
+			key: "abc1234", wantURL: "https://example.com/new", wantReads: 2,
+		},
+	})
+}
+
+func TestRedisDown(t *testing.T) {
+	tests := []struct {
+		name   string
+		action func(c *Store) error
+	}{
+		{name: "get falls back to the store", action: func(c *Store) error {
+			l, err := c.Get(context.Background(), "abc1234")
+			if err == nil && l.LongURL != "https://example.com" {
+				return errors.New("wrong link: " + l.LongURL)
+			}
+			return err
+		}},
+		{name: "create still works", action: func(c *Store) error {
+			return c.Create(context.Background(), link.Link{Key: "new1234", LongURL: "https://example.com/new"})
+		}},
+		{name: "update still works", action: func(c *Store) error {
+			return c.Update(context.Background(), link.Link{Key: "abc1234", LongURL: "https://example.com/new"})
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, backing, mr := newTestCache(t, DefaultConfig())
+			mustCreate(t, backing.Store, link.Link{Key: "abc1234", LongURL: "https://example.com"})
+			mr.Close()
+
+			start := time.Now()
+			if err := tt.action(c); err != nil {
+				t.Fatalf("with Redis down: %v", err)
+			}
+			// The redirect latency budget is 100 ms; an unavailable cache must not eat it.
+			if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+				t.Errorf("took %v with Redis down, want < 200ms", elapsed)
+			}
+		})
 	}
 }
