@@ -11,15 +11,21 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pristupaanastasia/shortener/internal/account"
 	"github.com/pristupaanastasia/shortener/internal/link"
 	"github.com/pristupaanastasia/shortener/internal/storage/memory"
 )
 
+// newTestHandler returns a handler without Redis-backed features.
 func newTestHandler(t *testing.T) (*Handler, *memory.Store) {
 	t.Helper()
 	store := memory.New()
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return New(link.NewService(store, "sho.rt"), "https://sho.rt/", logger), store
+	return New(Config{
+		Links:    link.NewService(store, "sho.rt"),
+		Accounts: account.NewService(memory.NewAccounts()),
+		BaseURL:  "https://sho.rt/",
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}), store
 }
 
 func do(h http.Handler, method, path, body string) *httptest.ResponseRecorder {

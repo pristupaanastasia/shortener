@@ -175,9 +175,24 @@ func (s *Store) Get(ctx context.Context, key string) (link.Link, error) {
 	return v.(entry).link(key)
 }
 
+// Update implements link.Store and invalidates the cached link.
+func (s *Store) Update(ctx context.Context, l link.Link) error {
+	if err := s.next.Update(ctx, l); err != nil {
+		return err
+	}
+	s.Invalidate(ctx, l.Key)
+	return nil
+}
+
+// ListByUser implements link.Store. Listings are not cached: they are rare and
+// change on every create, update and delete.
+func (s *Store) ListByUser(ctx context.Context, userID, cursor string, limit int) ([]link.Link, string, error) {
+	return s.next.ListByUser(ctx, userID, cursor, limit)
+}
+
 // Invalidate removes key from both cache levels, then again after
 // InvalidateDelay (delayed double delete). Call it after updating or deleting
-// a link in the store.
+// a link in the store; Update does it automatically.
 func (s *Store) Invalidate(ctx context.Context, key string) {
 	s.drop(ctx, key)
 	time.AfterFunc(s.cfg.InvalidateDelay, func() {

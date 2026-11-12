@@ -181,3 +181,112 @@ func TestServiceEndToEnd(t *testing.T) {
 		t.Errorf("LongURL = %q, want %q", got.LongURL, created.LongURL)
 	}
 }
+
+func TestUpdateAndSoftDelete(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	userID := gocql.MustRandomUUID().String()
+	l := link.Link{
+		Key:       uniqueKey(t),
+		LongURL:   "https://example.com/old",
+		UserID:    userID,
+		CreatedAt: time.Now().UTC().Truncate(time.Millisecond),
+	}
+	if err := s.Create(ctx, l); err != nil {
+		t.Fatal(err)
+	}
+
+	l.LongURL = "https://example.com/new"
+	if err := s.Update(ctx, l); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if got, _ := s.Get(ctx, l.Key); got.LongURL != l.LongURL {
+		t.Errorf("links: LongURL = %q, want %q", got.LongURL, l.LongURL)
+	}
+	page, _, err := s.ListByUser(ctx, userID, "", 10)
+	if err != nil || len(page) != 1 || page[0].LongURL != l.LongURL {
+		t.Fatalf("links_by_user after update = %+v, %v", page, err)
+	}
+
+	deleted := time.Now().UTC().Truncate(time.Millisecond)
+	l.DeletedAt = &deleted
+	if err := s.Update(ctx, l); err != nil {
+		t.Fatalf("soft delete: %v", err)
+	}
+	if got, _ := s.Get(ctx, l.Key); got.DeletedAt == nil {
+		t.Error("links: DeletedAt not set")
+	}
+	if page, _, _ := s.ListByUser(ctx, userID, "", 10); len(page) != 0 {
+		t.Errorf("deleted link still listed: %+v", page)
+	}
+}
+
+func TestUpdateMissing(t *testing.T) {
+	s := openTestStore(t)
+	key := uniqueKey(t)
+	err := s.Update(context.Background(), link.Link{Key: key, LongURL: "https://example.com"})
+	if !errors.Is(err, link.ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+	// IF EXISTS must not have created the row: a plain UPDATE is an upsert.
+	if _, err := s.Get(context.Background(), key); !errors.Is(err, link.ErrNotFound) {
+		t.Errorf("Get after failed update: err = %v", err)
+	}
+}
+
+func TestListByUserPagination(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	userID := gocql.MustRandomUUID().String()
+	base := time.Now().UTC().Truncate(time.Millisecond)
+
+	const total = 7
+	for i := range total {
+		l := link.Link{
+			Key:       uniqueKey(t),
+			LongURL:   "https://example.com",
+			UserID:    userID,
+			CreatedAt: base.Add(time.Duration(i) * time.Second),
+		}
+		if err := s.Create(ctx, l); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var all []link.Link
+	cursor := ""
+	pages := 0
+	for {
+		page, next, err := s.ListByUser(ctx, userID, cursor, 3)
+		if err != nil {
+			t.Fatalf("ListByUser: %v", err)
+		}
+		all = append(all, page...)
+		pages++
+		if next == "" {
+			break
+		}
+		cursor = next
+		if pages > total {
+			t.Fatal("pagination does not terminate")
+		}
+	}
+
+	if len(all) != total {
+		t.Fatalf("listed %d links, want %d", len(all), total)
+	}
+	seen := map[string]bool{}
+	for i, l := range all {
+		if seen[l.Key] {
+			t.Errorf("key %q listed twice", l.Key)
+		}
+		seen[l.Key] = true
+		if i > 0 && l.CreatedAt.After(all[i-1].CreatedAt) {
+			t.Errorf("not newest first at %d: %v after %v", i, l.CreatedAt, all[i-1].CreatedAt)
+		}
+	}
+
+	if _, _, err := s.ListByUser(ctx, userID, "!!!not-base64", 3); !errors.Is(err, link.ErrInvalidCursor) {
+		t.Errorf("bad cursor: err = %v, want ErrInvalidCursor", err)
+	}
+}

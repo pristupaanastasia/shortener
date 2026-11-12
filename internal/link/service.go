@@ -12,7 +12,13 @@ import (
 // maxKeyAttempts bounds retries on generated key collisions.
 const maxKeyAttempts = 5
 
-// Service creates and resolves links.
+// Page size limits for List.
+const (
+	DefaultPageSize = 50
+	MaxPageSize     = 100
+)
+
+// Service creates, resolves and manages links.
 type Service struct {
 	store   Store
 	ownHost string
@@ -32,20 +38,25 @@ func NewService(store Store, ownHost string) *Service {
 	}
 }
 
+// timestamp returns the current time at the precision Cassandra stores, so a
+// link reads back exactly as it was returned.
+func (s *Service) timestamp() time.Time {
+	return s.now().UTC().Truncate(time.Millisecond)
+}
+
 // CreateParams are the inputs for Create.
 type CreateParams struct {
 	LongURL   string
 	Alias     string     // optional
 	ExpiresAt *time.Time // optional
+	UserID    string     // empty for anonymous links
 }
 
 // Create validates p and stores a new link. With an alias, it fails with
 // ErrAliasTaken if the alias exists. Without one, it generates keys and
 // retries on collision.
 func (s *Service) Create(ctx context.Context, p CreateParams) (Link, error) {
-	// Millisecond precision matches what Cassandra stores, so a link reads
-	// back exactly as it was returned on creation.
-	now := s.now().UTC().Truncate(time.Millisecond)
+	now := s.timestamp()
 	if err := validateURL(p.LongURL, s.ownHost); err != nil {
 		return Link{}, err
 	}
@@ -53,7 +64,7 @@ func (s *Service) Create(ctx context.Context, p CreateParams) (Link, error) {
 		return Link{}, err
 	}
 
-	l := Link{LongURL: p.LongURL, CreatedAt: now, ExpiresAt: p.ExpiresAt}
+	l := Link{LongURL: p.LongURL, UserID: p.UserID, CreatedAt: now, ExpiresAt: p.ExpiresAt}
 
 	if p.Alias != "" {
 		if err := validateAlias(p.Alias); err != nil {
@@ -95,4 +106,81 @@ func (s *Service) Resolve(ctx context.Context, key string) (Link, error) {
 		return Link{}, ErrGone
 	}
 	return l, nil
+}
+
+// Get returns a link owned by userID. Links of other users, anonymous links
+// and deleted links all yield ErrNotFound, so the response does not reveal
+// whether someone else's link exists.
+func (s *Service) Get(ctx context.Context, userID, key string) (Link, error) {
+	l, err := s.store.Get(ctx, key)
+	if err != nil {
+		return Link{}, err
+	}
+	if userID == "" || l.UserID != userID || l.DeletedAt != nil {
+		return Link{}, ErrNotFound
+	}
+	return l, nil
+}
+
+// UpdateParams are the inputs for Update. Unset fields are left unchanged.
+type UpdateParams struct {
+	LongURL *string
+	// SetExpiresAt applies ExpiresAt, where nil makes the link permanent.
+	SetExpiresAt bool
+	ExpiresAt    *time.Time
+}
+
+// Update changes the target URL or expiration of a link owned by userID.
+func (s *Service) Update(ctx context.Context, userID, key string, p UpdateParams) (Link, error) {
+	l, err := s.Get(ctx, userID, key)
+	if err != nil {
+		return Link{}, err
+	}
+	if p.LongURL != nil {
+		if err := validateURL(*p.LongURL, s.ownHost); err != nil {
+			return Link{}, err
+		}
+		l.LongURL = *p.LongURL
+	}
+	if p.SetExpiresAt {
+		if err := validateExpiry(p.ExpiresAt, s.now()); err != nil {
+			return Link{}, err
+		}
+		l.ExpiresAt = p.ExpiresAt
+	}
+	if err := s.store.Update(ctx, l); err != nil {
+		return Link{}, fmt.Errorf("update link %q: %w", key, err)
+	}
+	return l, nil
+}
+
+// Delete soft-deletes a link owned by userID: the key is never reused and
+// redirects return 410. Deleting an already deleted link succeeds.
+func (s *Service) Delete(ctx context.Context, userID, key string) error {
+	l, err := s.store.Get(ctx, key)
+	if err != nil {
+		return err
+	}
+	if userID == "" || l.UserID != userID {
+		return ErrNotFound
+	}
+	if l.DeletedAt != nil {
+		return nil
+	}
+	now := s.timestamp()
+	l.DeletedAt = &now
+	if err := s.store.Update(ctx, l); err != nil {
+		return fmt.Errorf("delete link %q: %w", key, err)
+	}
+	return nil
+}
+
+// List returns a page of links owned by userID. limit <= 0 means
+// DefaultPageSize; it is capped at MaxPageSize.
+func (s *Service) List(ctx context.Context, userID, cursor string, limit int) ([]Link, string, error) {
+	if limit <= 0 {
+		limit = DefaultPageSize
+	}
+	limit = min(limit, MaxPageSize)
+	return s.store.ListByUser(ctx, userID, cursor, limit)
 }

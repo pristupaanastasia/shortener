@@ -36,14 +36,20 @@ Each milestone produces a working service. Work in order; the user reviews each 
 
 ## M4: Accounts and Link Management
 
-- [ ] PostgreSQL in `docker-compose.yml`: users and API keys
-- [ ] `Authorization: Bearer <api_key>` middleware (optional for create, required otherwise)
-- [ ] Rate limiting in Redis, `X-RateLimit-*` headers, 429 + `Retry-After`
-- [ ] `Idempotency-Key` support for `POST /api/v1/links`
-- [ ] `GET`, `PATCH`, `DELETE /api/v1/links/{key}` (404 for other users' links, soft delete); PATCH and DELETE invalidate the cache
-- [ ] `GET /api/v1/links` with cursor pagination from `links_by_user`
+- [x] PostgreSQL in `docker-compose.yml`: users and API keys
+- [x] `Authorization: Bearer <api_key>` middleware (optional for create, required otherwise)
+- [x] Rate limiting in Redis, `X-RateLimit-*` headers, 429 + `Retry-After`
+- [x] `Idempotency-Key` support for `POST /api/v1/links`
+- [x] `GET`, `PATCH`, `DELETE /api/v1/links/{key}` (404 for other users' links, soft delete); PATCH and DELETE invalidate the cache
+- [x] `GET /api/v1/links` with cursor pagination from `links_by_user`
 
 **Done when:** `make check` passes; tests cover auth, ownership, rate limit headers, idempotent retries and pagination across pages.
+
+## Test Format Refactoring
+
+- [ ] Rewrite all existing tests in the table-driven format from the `go-table-tests` skill (cases in a slice, `for range` + `t.Run`; `steps` slices for stateful scenarios)
+
+**Done when:** every `Test...` function follows the skill; the set of checked behaviors is unchanged (no assertion is dropped); `make check` and `make test-integration` pass.
 
 ## M5: Analytics
 
