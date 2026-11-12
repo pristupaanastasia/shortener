@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/pristupaanastasia/shortener/internal/account"
+	"github.com/pristupaanastasia/shortener/internal/analytics"
 	"github.com/pristupaanastasia/shortener/internal/idempotency"
 	"github.com/pristupaanastasia/shortener/internal/link"
 	"github.com/pristupaanastasia/shortener/internal/ratelimit"
@@ -35,6 +36,15 @@ type Config struct {
 	// Limiter and Idempotency are optional (nil disables them); both need Redis.
 	Limiter     *ratelimit.Limiter
 	Idempotency *idempotency.Store
+	// Clicks receives an event per redirect and Stats serves statistics;
+	// both are optional (nil disables analytics).
+	Clicks analytics.Publisher
+	Stats  analytics.StatsReader
+	// CountryHeader names the header with the client's country code, set by
+	// the CDN or load balancer (e.g. CF-IPCountry). Empty: country unknown.
+	// Only set it when every request passes through that edge, since clients
+	// can send the header themselves.
+	CountryHeader string
 	// BaseURL prefixes keys in short_url, e.g. "https://sho.rt".
 	BaseURL string
 	Logger  *slog.Logger
@@ -49,6 +59,9 @@ type Handler struct {
 	accounts       *account.Service
 	limiter        *ratelimit.Limiter
 	idempotency    *idempotency.Store
+	clicks         analytics.Publisher
+	stats          analytics.StatsReader
+	countryHeader  string
 	baseURL        string
 	logger         *slog.Logger
 	anonymousLimit int
@@ -64,6 +77,9 @@ func New(cfg Config) *Handler {
 		accounts:       cfg.Accounts,
 		limiter:        cfg.Limiter,
 		idempotency:    cfg.Idempotency,
+		clicks:         cfg.Clicks,
+		stats:          cfg.Stats,
+		countryHeader:  cfg.CountryHeader,
 		baseURL:        strings.TrimRight(cfg.BaseURL, "/"),
 		logger:         cfg.Logger,
 		anonymousLimit: cmpOr(cfg.AnonymousLimit, DefaultAnonymousLimit),
@@ -77,6 +93,7 @@ func New(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /api/v1/links/{key}", h.api(h.getLink, authRequired))
 	h.mux.HandleFunc("PATCH /api/v1/links/{key}", h.api(h.updateLink, authRequired))
 	h.mux.HandleFunc("DELETE /api/v1/links/{key}", h.api(h.deleteLink, authRequired))
+	h.mux.HandleFunc("GET /api/v1/links/{key}/stats", h.api(h.linkStats, authRequired))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	h.mux.HandleFunc("GET /{key}", h.redirect)
 	return h
@@ -291,6 +308,19 @@ func (h *Handler) redirect(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Location", l.LongURL)
 	w.Header().Set("Cache-Control", "private, max-age="+strconv.Itoa(redirectCacheAge(l, h.now())))
 	w.WriteHeader(http.StatusMovedPermanently)
+
+	if h.clicks != nil {
+		c := analytics.Click{
+			Key:       l.Key,
+			Time:      h.now(),
+			UserAgent: r.UserAgent(),
+			Referrer:  r.Referer(),
+		}
+		if h.countryHeader != "" {
+			c.Country = analytics.Country(r.Header.Get(h.countryHeader))
+		}
+		h.clicks.Publish(c) // never blocks
+	}
 }
 
 // redirectCacheAge returns max-age in seconds: maxRedirectCacheAge, or less if

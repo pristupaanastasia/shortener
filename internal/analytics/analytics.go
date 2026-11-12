@@ -5,6 +5,7 @@
 package analytics
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -28,6 +29,36 @@ type Click struct {
 // caller: losing an event is acceptable, slowing down a redirect is not.
 type Publisher interface {
 	Publish(Click)
+}
+
+// DayCount is the number of clicks on one day.
+type DayCount struct {
+	Day    time.Time
+	Clicks uint64
+}
+
+// ValueCount is the number of clicks for one value of a dimension.
+type ValueCount struct {
+	Value  string
+	Clicks uint64
+}
+
+// Stats are the statistics of one link over a range of days.
+type Stats struct {
+	Total      uint64
+	Timeseries []DayCount // days with at least one click, ascending
+	ByCountry  []ValueCount
+	ByDevice   []ValueCount
+	ByReferrer []ValueCount
+	// LastClick is the time of the latest ingested click of the link (zero
+	// if none): it shows how fresh the asynchronous statistics are.
+	LastClick time.Time
+}
+
+// StatsReader answers statistics queries.
+type StatsReader interface {
+	// Stats returns statistics for key between from and to, inclusive days.
+	Stats(ctx context.Context, key string, from, to time.Time) (Stats, error)
 }
 
 // Row is an enriched click as stored in ClickHouse.

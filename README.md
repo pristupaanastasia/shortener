@@ -336,7 +336,11 @@ Authorization: Bearer <api_key>
 }
 ```
 
-`updated_at` shows data freshness: analytics is asynchronous (Kafka → ClickHouse) and lags by minutes.
+`updated_at` is the time of the latest ingested click of the link (`null` if none): analytics is asynchronous (Kafka → ClickHouse), so it shows how fresh the numbers are.
+
+- Days are UTC; `from`/`to` default to the last 30 days, the range is at most 366 days, and only `granularity=day` is supported.
+- Each dimension returns its top 10 values.
+- Errors: 401 without a key, 404 for missing or other users' links, 400 for invalid dates, 503 `analytics_unavailable` when ClickHouse is not configured or unreachable.
 
 ## Data Model
 
@@ -526,13 +530,15 @@ This is the **cache-aside** pattern: the application reads the cache, falls back
 
 ### Flow 4: Analytics
 
-1. The Redirect Service publishes `{key, timestamp, ip, user_agent, referrer}` to the Kafka topic `clicks`, **partitioned by `key`** (all clicks of a link go to the same partition).
-2. **Analytics Consumers** read in batches:
-   - IP → country (local GeoIP database);
-   - User-Agent → device type;
-   - **the IP is then discarded**: it is personal data and is not stored without a reason (GDPR).
-3. Events are inserted into ClickHouse in batches of ~10K rows (ClickHouse handles large inserts well and small ones poorly).
-4. **Materialized views** in ClickHouse maintain daily and per-country aggregates; the Stats Service reads those instead of raw events.
+1. The Redirect Service publishes `{key, timestamp, country, user_agent, referrer}` to the Kafka topic `clicks`, **keyed by `key`** (all clicks of a link go to the same partition). Publishing never blocks: events are buffered in memory (up to 100K) and sent in batches; when the buffer is full, new events are dropped and counted.
+   - **No IP address enters the pipeline.** The country comes from a header set by the CDN or load balancer (e.g. Cloudflare's `CF-IPCountry`, configured with `COUNTRY_HEADER`). This avoids storing personal data (GDPR) and needs no GeoIP database. The header is read only when configured, since clients could send it themselves.
+2. **Analytics Consumers** (`cmd/consumer`, scaled independently) read in batches:
+   - User-Agent → device type (desktop, mobile, tablet, bot);
+   - Referer → host only (paths and queries may contain personal data);
+   - malformed events are logged and skipped, so they cannot block a partition.
+3. Events are inserted into ClickHouse in batches of up to 10K rows or every second (ClickHouse handles large inserts well and small ones poorly).
+   - **At-least-once delivery:** offsets are committed only after a successful insert. A crash between the two re-inserts that batch, so a click can be counted twice; none are lost. Failed inserts are retried with backoff.
+4. **Materialized views** in ClickHouse maintain daily and per-dimension (country, device, referrer) aggregates in `SummingMergeTree` tables; the Stats Service reads those instead of raw events. Raw events are kept for 90 days (TTL), aggregates forever.
 
 Kafka acts as a **buffer**: if ClickHouse is slow or down, events accumulate in Kafka (retained e.g. for 7 days) and are written later. Nothing is lost and redirects are unaffected.
 

@@ -2,6 +2,7 @@
 
 build:
 	go build -o bin/shortener ./cmd/shortener
+	go build -o bin/consumer ./cmd/consumer
 
 run:
 	go run ./cmd/shortener
@@ -26,6 +27,8 @@ smoke:
 smoke-full:
 	STORAGE=cassandra REDIS_ADDR=127.0.0.1:6379 \
 	POSTGRES_DSN="postgres://shortener:shortener@127.0.0.1:5432/shortener?sslmode=disable" \
+	KAFKA_BROKERS=127.0.0.1:9092 \
+	CLICKHOUSE_DSN="clickhouse://shortener:shortener@127.0.0.1:9000/shortener" \
 	./scripts/smoke.sh
 
 # gofmt -l prints unformatted files; fail if there are any.

@@ -33,8 +33,9 @@ while read -r local_ref local_sha remote_ref remote_sha; do
 			exit 1
 		fi
 		targets="lint coverage"
-		# Run the real service end to end when the commit has a smoke test.
-		if make -C "$dir" -n smoke-full >/dev/null 2>&1; then
+		# Older commits run the smoke test separately; newer ones include it
+		# in the coverage run.
+		if make -C "$dir" -n smoke-full >/dev/null 2>&1 && ! grep -q SMOKE_COVERDIR "$dir/scripts/coverage.sh"; then
 			targets="$targets smoke-full"
 		fi
 	elif $infra_up && make -C "$dir" -n test-integration >/dev/null 2>&1; then

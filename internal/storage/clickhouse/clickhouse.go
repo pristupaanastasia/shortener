@@ -113,52 +113,28 @@ func (s *Store) Insert(ctx context.Context, rows []analytics.Row) error {
 	return nil
 }
 
-// DayCount is the number of clicks on one day.
-type DayCount struct {
-	Day    time.Time
-	Clicks uint64
-}
-
-// ValueCount is the number of clicks for one value of a dimension.
-type ValueCount struct {
-	Value  string
-	Clicks uint64
-}
-
-// Stats are the statistics of one link over a range of days.
-type Stats struct {
-	Total      uint64
-	Timeseries []DayCount // days with at least one click, ascending
-	ByCountry  []ValueCount
-	ByDevice   []ValueCount
-	ByReferrer []ValueCount
-	// LastClick is the time of the latest ingested click of the link (zero
-	// if none): it shows how fresh the asynchronous statistics are.
-	LastClick time.Time
-}
-
-// Stats returns statistics for key between from and to (inclusive days).
-func (s *Store) Stats(ctx context.Context, key string, from, to time.Time) (Stats, error) {
-	var st Stats
+// Stats implements analytics.StatsReader.
+func (s *Store) Stats(ctx context.Context, key string, from, to time.Time) (analytics.Stats, error) {
+	var st analytics.Stats
 	rows, err := s.conn.Query(ctx, `
 		SELECT day, sum(clicks) FROM clicks_daily
 		WHERE key = ? AND day BETWEEN ? AND ?
 		GROUP BY day ORDER BY day`, key, from, to)
 	if err != nil {
-		return Stats{}, fmt.Errorf("query timeseries: %w", err)
+		return analytics.Stats{}, fmt.Errorf("query timeseries: %w", err)
 	}
 	for rows.Next() {
-		var d DayCount
+		var d analytics.DayCount
 		if err := rows.Scan(&d.Day, &d.Clicks); err != nil {
 			rows.Close()
-			return Stats{}, fmt.Errorf("scan timeseries: %w", err)
+			return analytics.Stats{}, fmt.Errorf("scan timeseries: %w", err)
 		}
 		st.Timeseries = append(st.Timeseries, d)
 		st.Total += d.Clicks
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return Stats{}, fmt.Errorf("query timeseries: %w", err)
+		return analytics.Stats{}, fmt.Errorf("query timeseries: %w", err)
 	}
 
 	rows, err = s.conn.Query(ctx, `
@@ -168,14 +144,14 @@ func (s *Store) Stats(ctx context.Context, key string, from, to time.Time) (Stat
 		ORDER BY dimension, c DESC, value
 		LIMIT ? BY dimension`, key, from, to, TopValues)
 	if err != nil {
-		return Stats{}, fmt.Errorf("query dimensions: %w", err)
+		return analytics.Stats{}, fmt.Errorf("query dimensions: %w", err)
 	}
 	for rows.Next() {
 		var dim string
-		var v ValueCount
+		var v analytics.ValueCount
 		if err := rows.Scan(&dim, &v.Value, &v.Clicks); err != nil {
 			rows.Close()
-			return Stats{}, fmt.Errorf("scan dimensions: %w", err)
+			return analytics.Stats{}, fmt.Errorf("scan dimensions: %w", err)
 		}
 		switch dim {
 		case "country":
@@ -188,12 +164,12 @@ func (s *Store) Stats(ctx context.Context, key string, from, to time.Time) (Stat
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return Stats{}, fmt.Errorf("query dimensions: %w", err)
+		return analytics.Stats{}, fmt.Errorf("query dimensions: %w", err)
 	}
 
 	// The sort key starts with key, so this reads only this link's rows.
 	if err := s.conn.QueryRow(ctx, `SELECT max(ts) FROM clicks WHERE key = ?`, key).Scan(&st.LastClick); err != nil {
-		return Stats{}, fmt.Errorf("query last click: %w", err)
+		return analytics.Stats{}, fmt.Errorf("query last click: %w", err)
 	}
 	if st.LastClick.Unix() <= 0 {
 		st.LastClick = time.Time{} // max() of no rows is the epoch

@@ -33,6 +33,28 @@ jobs:
           --health-cmd "redis-cli ping"
           --health-interval 5s
           --health-retries 10
+      kafka:
+        image: apache/kafka:3.9.0
+        ports: ["9092:9092"]
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 20
+          --health-start-period 20s
+      clickhouse:
+        image: clickhouse/clickhouse-server:24.8
+        ports: ["9000:9000"]
+        env:
+          CLICKHOUSE_DB: shortener
+          CLICKHOUSE_USER: shortener
+          CLICKHOUSE_PASSWORD: shortener # CI database only
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+        options: >-
+          --ulimit nofile=262144:262144
+          --health-cmd "clickhouse-client --user shortener --password shortener --query 'SELECT 1'"
+          --health-interval 5s
+          --health-retries 20
       postgres:
         image: postgres:17
         ports: ["5432:5432"]
@@ -55,14 +77,12 @@ jobs:
       - name: Lint
         run: make lint
 
-      - name: Unit and integration tests with coverage minimum
+      # Includes the full-stack smoke test, whose binaries count toward coverage.
+      - name: Tests, smoke test and coverage minimum
         run: make coverage
 
       - name: Smoke test (in memory)
         run: make smoke
-
-      - name: Smoke test (full stack)
-        run: make smoke-full
 
       - name: Upload coverage profile
         if: always()

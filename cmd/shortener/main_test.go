@@ -19,7 +19,7 @@ func TestLoadConfig(t *testing.T) {
 			if cfg.cassandra.Keyspace != "shortener" || cfg.cassandra.ReplicationFactor != 1 || len(cfg.cassandra.Hosts) != 1 {
 				t.Errorf("cassandra = %+v", cfg.cassandra)
 			}
-			if cfg.redisAddr != "" || cfg.postgresDSN != "" {
+			if cfg.redisAddr != "" || cfg.postgresDSN != "" || cfg.kafkaBrokers != nil || cfg.clickhouseDSN != "" || cfg.countryHeader != "" {
 				t.Errorf("optional dependencies enabled by default: %+v", cfg)
 			}
 		}},
@@ -29,6 +29,7 @@ func TestLoadConfig(t *testing.T) {
 				"ADDR": ":9000", "BASE_URL": "https://sho.rt", "STORAGE": "cassandra",
 				"CASSANDRA_HOSTS": "c1,c2,c3", "CASSANDRA_KEYSPACE": "links", "CASSANDRA_REPLICATION_FACTOR": "3",
 				"REDIS_ADDR": "redis:6379", "POSTGRES_DSN": "postgres://db",
+				"KAFKA_BROKERS": "k1:9092,k2:9092", "CLICKHOUSE_DSN": "clickhouse://ch", "COUNTRY_HEADER": "CF-IPCountry",
 			},
 			check: func(t *testing.T, cfg config) {
 				if cfg.addr != ":9000" || cfg.baseURL != "https://sho.rt" || cfg.storage != "cassandra" || cfg.redisAddr != "redis:6379" || cfg.postgresDSN != "postgres://db" {
@@ -36,6 +37,9 @@ func TestLoadConfig(t *testing.T) {
 				}
 				if len(cfg.cassandra.Hosts) != 3 || cfg.cassandra.Keyspace != "links" || cfg.cassandra.ReplicationFactor != 3 {
 					t.Errorf("cassandra = %+v", cfg.cassandra)
+				}
+				if len(cfg.kafkaBrokers) != 2 || cfg.clickhouseDSN != "clickhouse://ch" || cfg.countryHeader != "CF-IPCountry" {
+					t.Errorf("analytics = %v %q %q", cfg.kafkaBrokers, cfg.clickhouseDSN, cfg.countryHeader)
 				}
 			},
 		},
@@ -45,7 +49,7 @@ func TestLoadConfig(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			for _, k := range []string{"ADDR", "BASE_URL", "STORAGE", "CASSANDRA_HOSTS", "CASSANDRA_KEYSPACE", "CASSANDRA_REPLICATION_FACTOR", "REDIS_ADDR", "POSTGRES_DSN"} {
+			for _, k := range []string{"ADDR", "BASE_URL", "STORAGE", "CASSANDRA_HOSTS", "CASSANDRA_KEYSPACE", "CASSANDRA_REPLICATION_FACTOR", "REDIS_ADDR", "POSTGRES_DSN", "KAFKA_BROKERS", "CLICKHOUSE_DSN", "COUNTRY_HEADER"} {
 				t.Setenv(k, tt.env[k])
 			}
 			cfg, err := loadConfig()

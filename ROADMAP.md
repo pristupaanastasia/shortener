@@ -53,11 +53,11 @@ Each milestone produces a working service. Work in order; the user reviews each 
 
 ## M5: Analytics
 
-- [ ] Kafka and ClickHouse in `docker-compose.yml`
-- [ ] Redirect Service publishes click events asynchronously (non-blocking, drop on failure)
-- [ ] Consumer: enrich (country, device), drop IP, batch-insert into ClickHouse
-- [ ] ClickHouse materialized views for daily / per-country / per-device / per-referrer aggregates
-- [ ] `GET /api/v1/links/{key}/stats` with `updated_at`
+- [x] Kafka and ClickHouse in `docker-compose.yml`
+- [x] Redirect Service publishes click events asynchronously (non-blocking, drop on failure)
+- [x] Consumer: enrich (country, device), batch-insert into ClickHouse (no IP enters the pipeline: the country comes from an edge header, see `README.md`)
+- [x] ClickHouse materialized views for daily / per-country / per-device / per-referrer aggregates
+- [x] `GET /api/v1/links/{key}/stats` with `updated_at`
 
 **Done when:** `make check` passes; clicking a link N times shows N clicks in `/stats` within a minute; redirects keep working when Kafka is stopped.
 
