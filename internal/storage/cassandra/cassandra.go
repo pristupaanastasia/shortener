@@ -13,6 +13,8 @@ import (
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 
 	"github.com/pristupaanastasia/shortener/internal/link"
+	"github.com/pristupaanastasia/shortener/internal/migrate"
+	"github.com/pristupaanastasia/shortener/migrations"
 )
 
 // Config configures the connection and schema.
@@ -53,12 +55,18 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	cluster.SerialConsistency = gocql.Serial
 	cluster.Timeout = 5 * time.Second
 	cluster.ConnectTimeout = 10 * time.Second
+
+	// The keyspace depends on the deployment (replication factor), so it is
+	// created here; everything inside it comes from migrations.
+	if err := createKeyspace(ctx, cluster, cfg.Keyspace, cfg.ReplicationFactor); err != nil {
+		return nil, err
+	}
+	cluster.Keyspace = cfg.Keyspace
 	session, err := cluster.CreateSession()
 	if err != nil {
 		return nil, fmt.Errorf("connect to cassandra %v: %w", cfg.Hosts, err)
 	}
-
-	if err := migrate(ctx, session, cfg.Keyspace, cfg.ReplicationFactor); err != nil {
+	if err := applyMigrations(ctx, session); err != nil {
 		session.Close()
 		return nil, err
 	}
@@ -88,30 +96,55 @@ func (s *Store) Close() {
 	s.session.Close()
 }
 
-func migrate(ctx context.Context, session *gocql.Session, ks string, rf int) error {
-	statements := []string{
-		fmt.Sprintf(`CREATE KEYSPACE IF NOT EXISTS %s
-			WITH replication = {'class': 'SimpleStrategy', 'replication_factor': %d}`, ks, rf),
-		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s.links (
-			key         text PRIMARY KEY,
-			long_url    text,
-			user_id     uuid,
-			created_at  timestamp,
-			expires_at  timestamp,
-			deleted_at  timestamp
-		)`, ks),
-		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s.links_by_user (
-			user_id     uuid,
-			created_at  timestamp,
-			key         text,
-			long_url    text,
-			expires_at  timestamp,
-			PRIMARY KEY ((user_id), created_at, key)
-		) WITH CLUSTERING ORDER BY (created_at DESC, key ASC)`, ks),
+func createKeyspace(ctx context.Context, cluster *gocql.ClusterConfig, ks string, rf int) error {
+	session, err := cluster.CreateSession()
+	if err != nil {
+		return fmt.Errorf("connect to cassandra %v: %w", cluster.Hosts, err)
 	}
-	for _, stmt := range statements {
-		if err := session.Query(stmt).ExecContext(ctx); err != nil {
-			return fmt.Errorf("migrate: %w", err)
+	defer session.Close()
+	err = session.Query(fmt.Sprintf(`CREATE KEYSPACE IF NOT EXISTS %s
+		WITH replication = {'class': 'SimpleStrategy', 'replication_factor': %d}`, ks, rf)).ExecContext(ctx)
+	if err != nil {
+		return fmt.Errorf("create keyspace %s: %w", ks, err)
+	}
+	return nil
+}
+
+// applyMigrations runs the migrations from migrations/cassandra that are not
+// recorded in schema_migrations. Cassandra has no transactional DDL, so every
+// statement must be idempotent (IF NOT EXISTS): a migration interrupted after
+// some statements is safely re-run from the start.
+func applyMigrations(ctx context.Context, session *gocql.Session) error {
+	all, err := migrate.Load(migrations.Cassandra, "cassandra")
+	if err != nil {
+		return err
+	}
+	err = session.Query(`CREATE TABLE IF NOT EXISTS schema_migrations (
+		version int PRIMARY KEY, name text, applied_at timestamp)`).ExecContext(ctx)
+	if err != nil {
+		return fmt.Errorf("create schema_migrations: %w", err)
+	}
+
+	applied := map[int]bool{}
+	iter := session.Query(`SELECT version FROM schema_migrations`).IterContext(ctx)
+	var v int
+	for iter.Scan(&v) {
+		applied[v] = true
+	}
+	if err := iter.Close(); err != nil {
+		return fmt.Errorf("read schema_migrations: %w", err)
+	}
+
+	for _, m := range migrate.Pending(all, applied) {
+		for _, stmt := range m.Statements {
+			if err := session.Query(stmt).ExecContext(ctx); err != nil {
+				return fmt.Errorf("migration %s: %w", m.Name, err)
+			}
+		}
+		err := session.Query(`INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)`,
+			m.Version, m.Name, time.Now()).ExecContext(ctx)
+		if err != nil {
+			return fmt.Errorf("record migration %s: %w", m.Name, err)
 		}
 	}
 	return nil
