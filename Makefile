@@ -1,4 +1,4 @@
-.PHONY: build run test test-integration coverage lint check up down hooks
+.PHONY: build run test test-integration coverage smoke smoke-full lint check up down hooks
 
 build:
 	go build -o bin/shortener ./cmd/shortener
@@ -17,6 +17,16 @@ test-integration:
 # 80%). Needs the infrastructure from `make up`.
 coverage:
 	./scripts/coverage.sh
+
+# Start the real service and walk through the main user journey with curl.
+smoke:
+	./scripts/smoke.sh
+
+# The same against the full stack from `make up`.
+smoke-full:
+	STORAGE=cassandra REDIS_ADDR=127.0.0.1:6379 \
+	POSTGRES_DSN="postgres://shortener:shortener@127.0.0.1:5432/shortener?sslmode=disable" \
+	./scripts/smoke.sh
 
 # gofmt -l prints unformatted files; fail if there are any.
 lint:

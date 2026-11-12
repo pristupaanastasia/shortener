@@ -1,5 +1,6 @@
 #!/bin/sh
-# Lint, test and enforce the coverage minimum for every commit being pushed.
+# Lint, test, enforce the coverage minimum and smoke-test the running service
+# for every commit being pushed.
 # Enabled by `make hooks`. Skip in an emergency: git push --no-verify
 #
 # Each pushed commit is checked out into a temporary worktree, so the checks
@@ -30,6 +31,10 @@ while read -r local_ref local_sha remote_ref remote_sha; do
 			exit 1
 		fi
 		targets="lint coverage"
+		# Run the real service end to end when the commit has a smoke test.
+		if make -C "$dir" -n smoke-full >/dev/null 2>&1; then
+			targets="$targets smoke-full"
+		fi
 	elif $infra_up && make -C "$dir" -n test-integration >/dev/null 2>&1; then
 		targets="lint test-integration"
 	else
