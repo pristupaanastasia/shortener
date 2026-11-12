@@ -56,8 +56,9 @@ func (s *memorySink) count(key string) int {
 	return n
 }
 
-// consume runs a consumer in group until stop is called.
-func consume(t *testing.T, group string, sink Sink) (stop func()) {
+// consume runs a consumer in group until stop is called; stop returns Run's
+// error.
+func consume(t *testing.T, group string, sink Sink) (stop func() error) {
 	t.Helper()
 	c, err := NewConsumer(ConsumerConfig{Brokers: brokers(), Group: group, BatchSize: 100, FlushInterval: 200 * time.Millisecond},
 		sink, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -67,16 +68,69 @@ func consume(t *testing.T, group string, sink Sink) (stop func()) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- c.Run(ctx) }()
-	return func() {
+	return func() error {
 		cancel()
 		select {
 		case err := <-done:
-			if err != nil {
-				t.Errorf("Run: %v", err)
-			}
+			return err
 		case <-time.After(30 * time.Second):
 			t.Error("consumer did not stop within 30s")
+			return nil
 		}
+	}
+}
+
+func publish(t *testing.T, key string, n int) {
+	t.Helper()
+	pub, err := NewKafkaPublisher(brokers(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range n {
+		pub.Publish(Click{Key: key, Time: time.Now(), Country: "DE", UserAgent: "curl/8.7.1"})
+	}
+	pub.Close() // flushes
+	if pub.Dropped() != 0 {
+		t.Fatalf("%d events dropped with Kafka up", pub.Dropped())
+	}
+}
+
+// Regression: stopping while an insert was being retried committed the
+// offsets of the batch that was never stored, losing it.
+func TestStopDuringRetryKeepsEvents(t *testing.T) {
+	tests := []struct {
+		name   string
+		events int
+	}{
+		{name: "events survive a shutdown during insert retries", events: 5},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			key := "it" + strings.ToLower(rand.Text())[:10]
+			group := "it-" + key
+			publish(t, key, tt.events)
+
+			down := &memorySink{failures: 1 << 30} // ClickHouse is down
+			stop := consume(t, group, down)
+			waitFor(t, "the consumer to start retrying", func() bool {
+				down.mu.Lock()
+				defer down.mu.Unlock()
+				return down.inserts >= 2
+			})
+			if err := stop(); err == nil {
+				t.Error("Run returned nil after failing to store a batch, want an error")
+			}
+
+			up := &memorySink{}
+			stop = consume(t, group, up)
+			waitFor(t, "events after restart", func() bool { return up.count(key) >= tt.events })
+			if err := stop(); err != nil {
+				t.Errorf("Run: %v", err)
+			}
+			if got := up.count(key); got != tt.events {
+				t.Errorf("after restart the sink has %d of %d events", got, tt.events)
+			}
+		})
 	}
 }
 
@@ -106,17 +160,7 @@ func TestKafkaPipeline(t *testing.T) {
 			key := "it" + strings.ToLower(rand.Text())[:10]
 			group := "it-" + key
 
-			pub, err := NewKafkaPublisher(brokers(), slog.New(slog.NewTextHandler(io.Discard, nil)))
-			if err != nil {
-				t.Fatal(err)
-			}
-			for range tt.events {
-				pub.Publish(Click{Key: key, Time: time.Now(), Country: "DE", UserAgent: "curl/8.7.1"})
-			}
-			pub.Close() // flushes
-			if pub.Dropped() != 0 {
-				t.Fatalf("%d events dropped with Kafka up", pub.Dropped())
-			}
+			publish(t, key, tt.events)
 			// A malformed record must be skipped, not block the partition.
 			raw, err := kgo.NewClient(kgo.SeedBrokers(brokers()...), kgo.DefaultProduceTopic(Topic))
 			if err != nil {
@@ -130,7 +174,9 @@ func TestKafkaPipeline(t *testing.T) {
 			sink := &memorySink{failures: tt.sinkFailures}
 			stop := consume(t, group, sink)
 			waitFor(t, "all events in the sink", func() bool { return sink.count(key) >= tt.events })
-			stop()
+			if err := stop(); err != nil {
+				t.Errorf("Run: %v", err)
+			}
 			if got := sink.count(key); got != tt.events {
 				t.Errorf("sink has %d events, want %d", got, tt.events)
 			}
@@ -147,7 +193,9 @@ func TestKafkaPipeline(t *testing.T) {
 			again := &memorySink{}
 			stop = consume(t, group, again)
 			time.Sleep(3 * time.Second)
-			stop()
+			if err := stop(); err != nil {
+				t.Errorf("Run: %v", err)
+			}
 			if got := again.count(key); got != 0 {
 				t.Errorf("restarted consumer re-read %d committed events", got)
 			}

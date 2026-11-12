@@ -93,31 +93,31 @@ func (c *Consumer) Run(ctx context.Context) error {
 }
 
 // flush inserts the batch, retrying until it succeeds, then commits offsets.
-// When stopping, it makes one last attempt with a fresh timeout.
+// When stopping (or when ctx is cancelled during a retry), it makes one last
+// attempt with a fresh timeout; if that fails, it returns an error and does
+// not commit, so the batch is read again after a restart.
 func (c *Consumer) flush(ctx context.Context, batch []Row, stopping bool) error {
-	if len(batch) > 0 {
-		for attempt := 1; ; attempt++ {
-			insertCtx := ctx
-			if stopping {
-				var cancel context.CancelFunc
-				insertCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-				defer cancel()
-			}
-			err := c.sink.Insert(insertCtx, batch)
-			if err == nil {
-				break
-			}
-			if stopping || ctx.Err() != nil {
-				return fmt.Errorf("insert %d clicks on shutdown: %w", len(batch), err)
-			}
-			c.logger.Warn("insert clicks, retrying", "rows", len(batch), "attempt", attempt, "err", err)
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-time.After(min(time.Duration(attempt)*time.Second, 30*time.Second)):
-			}
+	for attempt := 1; len(batch) > 0; attempt++ {
+		insertCtx, cancel := ctx, context.CancelFunc(func() {})
+		if stopping {
+			insertCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		}
+		err := c.sink.Insert(insertCtx, batch)
+		cancel()
+		if err == nil {
+			break
+		}
+		if stopping {
+			return fmt.Errorf("insert %d clicks on shutdown, offsets not committed: %w", len(batch), err)
+		}
+		c.logger.Warn("insert clicks, retrying", "rows", len(batch), "attempt", attempt, "err", err)
+		select {
+		case <-ctx.Done():
+			stopping = true // one last attempt, then give up without committing
+		case <-time.After(min(time.Duration(attempt)*time.Second, 30*time.Second)):
 		}
 	}
+
 	commitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
 	if err := c.client.CommitUncommittedOffsets(commitCtx); err != nil {
