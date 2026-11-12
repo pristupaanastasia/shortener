@@ -11,6 +11,7 @@ URL shortener in Go, built as a learning project for system design and agentic d
 
 - `make check`: lint (`gofmt`, `go vet`) + tests with the race detector. Must pass before every commit.
 - `make test`: tests only.
+- `make test-integration`: unit + integration tests (`integration` build tag); needs `make up`. Run it before committing changes to storage, caches or queues.
 - `make run`: start the service locally.
 - `make up` / `make down`: start/stop infrastructure from `docker-compose.yml` (from M2 on).
 

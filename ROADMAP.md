@@ -17,20 +17,20 @@ Each milestone produces a working service. Work in order; the user reviews each 
 
 ## M2: Cassandra Storage
 
-- [ ] `docker-compose.yml` with Cassandra; schema from `README.md` applied on startup
-- [ ] Cassandra `LinkStore`: `links` + `links_by_user` in a logged batch, `IF NOT EXISTS`, `QUORUM` writes and reads
-- [ ] Store is selected by config (`STORAGE=memory|cassandra`)
-- [ ] Integration tests (`integration` build tag) against the compose Cassandra
+- [x] `docker-compose.yml` with Cassandra; schema from `README.md` applied on startup
+- [x] Cassandra `LinkStore`: `IF NOT EXISTS` into `links`, then `links_by_user` (a conditional batch cannot span tables, see `README.md`), `QUORUM` writes and reads
+- [x] Store is selected by config (`STORAGE=memory|cassandra`)
+- [x] Integration tests (`integration` build tag) against the compose Cassandra
 
 **Done when:** `make check` passes; `make up` + integration tests pass; the service works end to end with `STORAGE=cassandra`.
 
 ## M3: Caching
 
-- [ ] Redis in `docker-compose.yml` (`allkeys-lfu`)
-- [ ] Redirect read path: L1 in-process LRU (TTL 10s) → Redis (TTL 1h + jitter) → store
-- [ ] `singleflight` on cache misses
-- [ ] Negative caching of missing keys (1–5 min)
-- [ ] Invalidation on update/delete with delayed double delete
+- [x] Redis in `docker-compose.yml` (`allkeys-lfu`)
+- [x] Redirect read path: L1 in-process LRU (TTL 10s) → Redis (TTL 1h + jitter) → store
+- [x] `singleflight` on cache misses
+- [x] Negative caching of missing keys (1–5 min)
+- [x] Invalidation with delayed double delete (`cache.Store.Invalidate`; there is no update/delete yet, it is wired up in M4)
 
 **Done when:** `make check` passes; tests show that concurrent misses for one key hit the store once, and that a deleted link stops resolving after invalidation.
 
@@ -40,7 +40,7 @@ Each milestone produces a working service. Work in order; the user reviews each 
 - [ ] `Authorization: Bearer <api_key>` middleware (optional for create, required otherwise)
 - [ ] Rate limiting in Redis, `X-RateLimit-*` headers, 429 + `Retry-After`
 - [ ] `Idempotency-Key` support for `POST /api/v1/links`
-- [ ] `GET`, `PATCH`, `DELETE /api/v1/links/{key}` (404 for other users' links, soft delete)
+- [ ] `GET`, `PATCH`, `DELETE /api/v1/links/{key}` (404 for other users' links, soft delete); PATCH and DELETE invalidate the cache
 - [ ] `GET /api/v1/links` with cursor pagination from `links_by_user`
 
 **Done when:** `make check` passes; tests cover auth, ownership, rate limit headers, idempotent retries and pagination across pages.

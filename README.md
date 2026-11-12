@@ -365,7 +365,8 @@ CREATE TABLE links_by_user (
    - Custom aliases use a Lightweight Transaction: `INSERT ... IF NOT EXISTS` (Paxos-based, ~4× slower than a regular write; acceptable at 1–3K write RPS).
    - Generated keys use the same check: they are random, so collisions are possible (see [Deep Dive: Key Generation](#deep-dive-key-generation)).
 2. **No queries by arbitrary columns.** `WHERE user_id = ?` on `links` would hit every node, which is why `links_by_user` exists.
-3. **Native TTL is not used.** After a row expires, the redirect would return 404 instead of 410, and the alias would become free, so old links could point to someone else's content. Instead, `expires_at` is checked on read, and expired links are archived by a background job.
+3. **Conditional batches are limited to one partition of one table.** `INSERT ... IF NOT EXISTS` into `links` cannot be batched with the `links_by_user` insert, so the two writes are sequential: the LWT into `links` decides whether the key is taken, then `links_by_user` is written with a plain insert. Verified by an integration test: without `IF NOT EXISTS`, 20 of 20 concurrent inserts of the same key "succeed", silently overwriting each other.
+4. **Native TTL is not used.** After a row expires, the redirect would return 404 instead of 410, and the alias would become free, so old links could point to someone else's content. Instead, `expires_at` is checked on read, and expired links are archived by a background job.
 
 ## High-Level Design
 
@@ -434,18 +435,27 @@ All services are **stateless**: state lives only in the storage layer, so servic
 ### Flow 1: Redirect (hot path)
 
 1. **Load Balancer** routes `GET sho.rt/abc1234` directly to the Redirect Service, bypassing the API Gateway (no auth needed, every extra hop adds latency).
-2. **Redis** `GET link:abc1234`:
-   - **hit** (most requests): go to step 4;
-   - **miss**: go to step 3.
-3. **Cassandra** `SELECT ... WHERE key = 'abc1234'` with consistency `ONE` (fastest, eventual consistency is acceptable). The result is cached in Redis with `TTL = min(1h, expires_at - now)`.
-   - **Negative caching:** a missing key is also cached as "not found" for 1–5 minutes. Otherwise a bot enumerating random keys would bypass the cache and flood Cassandra.
+2. **Cache lookup**, two levels:
+   - **L1:** an in-process LRU (100K entries, TTL 10s). A viral link is served from memory on every instance instead of hammering a single Redis shard (hot key);
+   - **L2:** Redis `GET link:abc1234`;
+   - **hit** (most requests): go to step 4; **miss**: go to step 3.
+3. **Cassandra** `SELECT ... WHERE key = 'abc1234'` with consistency `QUORUM`. With `QUORUM` writes, `W + R > N` guarantees the read sees the latest write; with `ONE`, a miss could load a stale replica into the cache for an hour. Misses are a small fraction of traffic, so the extra cost is affordable.
+   - Concurrent misses for the same key on one instance are collapsed into one Cassandra read (`singleflight`), which prevents a cache stampede when a hot key expires.
+   - The result is cached in Redis with `TTL = 1h + random(0, 10m)`. The jitter keeps entries that were cached together from expiring together (cache avalanche). Expired and deleted links are cached too: the service checks `expires_at`/`deleted_at` on every read, so 410 is served from cache.
+   - **Negative caching:** a missing key is cached as "not found" for 1 minute. Otherwise a bot enumerating random keys would bypass the cache and flood Cassandra. Creating a link drops its negative entry, so a new alias resolves immediately (other instances' L1 may serve 404 for up to 10s).
+   - **Redis failures are treated as misses**, never as errors. The Redis client uses tight timeouts and minimal retries: with library defaults, an unavailable Redis added ~5 s to every request (measured in tests).
 4. **Checks and response:**
    - `deleted_at` set or `expires_at` in the past: **410**;
    - not found: **404**;
    - otherwise: **301** + `Location` + `Cache-Control: private, max-age=N`.
 5. **Click event to Kafka**, asynchronously. The response does not wait for Kafka: the producer buffers events in memory and sends them in batches. If Kafka is unavailable, the event is dropped: redirects are more important than analytics.
 
-**Latency:** Redis ~1 ms, Cassandra on a miss ~5–10 ms, well within the 100 ms budget.
+**Latency** (measured locally): L1 hit ~0.3 ms, cache miss to Cassandra ~5 ms, Redis down ~10 ms on the first miss, then L1 again. Well within the 100 ms budget.
+
+**Known limitations:**
+
+- A Redis that hangs (accepts connections but does not respond) costs up to the 50 ms timeout per operation. A circuit breaker would skip Redis entirely after repeated failures.
+- While Redis is down, every miss logs a warning; at production traffic, these logs need rate limiting.
 
 ### Flow 2: Create a link
 
@@ -457,7 +467,7 @@ All services are **stateless**: state lives only in the storage layer, so servic
    - URL validation: `http`/`https` scheme, length, not pointing to our own domain (prevents redirect loops);
    - **with alias:** `INSERT ... IF NOT EXISTS` (LWT); 409 if the row already exists;
    - **without alias:** generate a key and insert it with `IF NOT EXISTS`; on collision, retry with a new key.
-3. **Cassandra:** write to `links` and `links_by_user` in one **logged batch**, so both tables are eventually updated together. Consistency `QUORUM` (2 of 3 replicas) to guarantee durability.
+3. **Cassandra:** insert into `links` with `IF NOT EXISTS` (this is what guarantees key uniqueness), then, for links with an owner, a plain insert into `links_by_user`. Both with consistency `QUORUM` (2 of 3 replicas) to guarantee durability. They cannot be combined into one batch: Cassandra rejects conditional batches that span tables.
 4. Respond **201**.
 
 The cache is **not warmed** on creation: most links never become hot, and the first click populates the cache.
@@ -467,7 +477,7 @@ The cache is **not warmed** on creation: most links never become hot, and the fi
 1. API Gateway: auth, rate limit.
 2. Link Service checks that the link's `user_id` matches the API key owner; otherwise 404.
 3. Update both Cassandra tables with `QUORUM`.
-4. `DEL link:abc1234` in Redis: the next click reads fresh data from Cassandra.
+4. Invalidate the cache with a **delayed double delete**: `DEL link:abc1234` in Redis and L1, and again after ~1 s. The second delete removes a stale value written back by a concurrent reader that loaded it from Cassandra before the update. Other instances' L1 entries expire within 10 s.
 5. Browsers pick up the change within ≤ 90 seconds (`max-age`).
 
 This is the **cache-aside** pattern: the application reads the cache, falls back to the database on a miss and invalidates the cache on writes.
@@ -495,12 +505,12 @@ The **Cleanup Worker** runs daily, finds links with `expires_at` in the past and
 
 | Where | Problem | Solution |
 |---|---|---|
-| `links` + `links_by_user` | two tables in one database | logged batch |
+| `links` + `links_by_user` | two tables; the `links` insert is an LWT, and Cassandra does not allow conditional batches across tables | LWT into `links` first, then an idempotent insert into `links_by_user`; if the second write fails, the link still works and the request is retried (with `Idempotency-Key`) |
 | Create → Redis | none: the cache is populated lazily | — |
 | Clicks → Kafka | no database write involved; losing an event is acceptable | async fire-and-forget |
 | Update/delete → `DEL` in Redis | real dual write: if `DEL` fails, the cache serves the old URL until TTL | retry with backoff + cache TTL capped at 1 hour (or CDC-based invalidation) |
 
-**Transactional outbox is not needed here.** It solves a different problem: an event that **must not be lost** and is produced by a database write (e.g. "link created" for a phishing scanner or billing). If such an event appears, it would be written to an `outbox` table in the same logged batch and relayed to Kafka. With Cassandra, CDC is usually preferred over an outbox table, since processed and deleted rows leave tombstones that slow down reads.
+**Transactional outbox is not needed here.** It solves a different problem: an event that **must not be lost** and is produced by a database write (e.g. "link created" for a phishing scanner or billing). If such an event appears, it would be written to an `outbox` table and relayed to Kafka (since the `links` insert is an LWT, it cannot share a batch with it either). With Cassandra, CDC is usually preferred over an outbox table, since processed and deleted rows leave tombstones that slow down reads.
 
 ### Open Questions for the Deep Dive
 

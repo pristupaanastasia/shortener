@@ -1,4 +1,4 @@
-.PHONY: build run test lint check up down
+.PHONY: build run test test-integration lint check up down
 
 build:
 	go build -o bin/shortener ./cmd/shortener
@@ -9,11 +9,15 @@ run:
 test:
 	go test -race -count=1 ./...
 
+# Needs the infrastructure from `make up`.
+test-integration:
+	go test -race -count=1 -tags integration ./...
+
 # gofmt -l prints unformatted files; fail if there are any.
 lint:
 	@unformatted=$$(gofmt -l .); \
 	if [ -n "$$unformatted" ]; then echo "unformatted files:"; echo "$$unformatted"; exit 1; fi
-	go vet ./...
+	go vet -tags integration ./...
 
 # Everything that must pass before a commit.
 check: lint test

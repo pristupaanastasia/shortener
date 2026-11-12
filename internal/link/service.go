@@ -43,7 +43,9 @@ type CreateParams struct {
 // ErrAliasTaken if the alias exists. Without one, it generates keys and
 // retries on collision.
 func (s *Service) Create(ctx context.Context, p CreateParams) (Link, error) {
-	now := s.now().UTC()
+	// Millisecond precision matches what Cassandra stores, so a link reads
+	// back exactly as it was returned on creation.
+	now := s.now().UTC().Truncate(time.Millisecond)
 	if err := validateURL(p.LongURL, s.ownHost); err != nil {
 		return Link{}, err
 	}
