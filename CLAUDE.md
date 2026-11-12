@@ -15,7 +15,7 @@ URL shortener in Go, built as a learning project for system design and agentic d
 - `make run`: start the service locally.
 - `make coverage`: unit + integration tests with a total coverage minimum of 80% (`COVERAGE_MIN`); needs `make up`.
 - `make smoke` / `make smoke-full`: build and start the real service, walk through the main user journey with curl, check a clean shutdown; in memory, or against the `make up` stack.
-- `make hooks`: enable the git `pre-push` hook: lint + `make coverage` + `make smoke-full` for every pushed commit, so pushing requires `make up`. Run once per clone.
+- `make hooks`: enable the git `pre-push` hook: lint + `make coverage` + `make smoke-full` for the tip commit of every pushed branch, so pushing requires `make up`. Run once per clone.
 - CI (`.github/workflows/ci.yml`) runs the same checks on every push and pull request.
 - `make up` / `make down`: start/stop infrastructure from `docker-compose.yml` (from M2 on).
 

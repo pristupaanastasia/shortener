@@ -10,6 +10,8 @@ import (
 	"net/mail"
 	"strings"
 	"time"
+
+	"github.com/hashicorp/golang-lru/v2/expirable"
 )
 
 // Errors returned by the service.
@@ -38,15 +40,33 @@ type Store interface {
 
 const keyPrefix = "sk_"
 
+// Valid keys are cached in memory, so most API requests do not query
+// PostgreSQL. The trade-off: revoking a key takes effect within keyCacheTTL.
+const (
+	keyCacheSize = 10_000
+	keyCacheTTL  = time.Minute
+)
+
 // Service registers and authenticates users.
 type Service struct {
 	store Store
 	now   func() time.Time
+	keys  *expirable.LRU[string, User] // by key hash
 }
 
 // NewService returns a Service backed by store.
 func NewService(store Store) *Service {
-	return &Service{store: store, now: time.Now}
+	return &Service{
+		store: store,
+		now:   time.Now,
+		keys:  expirable.NewLRU[string, User](keyCacheSize, nil, keyCacheTTL),
+	}
+}
+
+// Cached returns the owner of apiKey if it was validated recently, without
+// querying the store. Only valid keys are cached: guessed keys are random.
+func (s *Service) Cached(apiKey string) (User, bool) {
+	return s.keys.Get(string(HashKey(apiKey)))
 }
 
 // Register creates a user and returns its API key. The key is shown only
@@ -70,13 +90,18 @@ func (s *Service) Authenticate(ctx context.Context, apiKey string) (User, error)
 	if !strings.HasPrefix(apiKey, keyPrefix) {
 		return User{}, ErrInvalidKey
 	}
-	u, err := s.store.UserByKeyHash(ctx, HashKey(apiKey))
+	hash := HashKey(apiKey)
+	if u, ok := s.keys.Get(string(hash)); ok {
+		return u, nil
+	}
+	u, err := s.store.UserByKeyHash(ctx, hash)
 	if errors.Is(err, ErrNotFound) {
 		return User{}, ErrInvalidKey
 	}
 	if err != nil {
 		return User{}, fmt.Errorf("authenticate: %w", err)
 	}
+	s.keys.Add(string(hash), u)
 	return u, nil
 }
 

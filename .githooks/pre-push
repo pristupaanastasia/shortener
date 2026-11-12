@@ -1,10 +1,12 @@
 #!/bin/sh
 # Lint, test, enforce the coverage minimum and smoke-test the running service
-# for every commit being pushed.
+# for the tip commit of every pushed branch.
 # Enabled by `make hooks`. Skip in an emergency: git push --no-verify
 #
-# Each pushed commit is checked out into a temporary worktree, so the checks
-# cover exactly what is pushed, not uncommitted changes in the working tree.
+# The tip commit is checked out into a temporary worktree, so the checks cover
+# exactly what is pushed, not uncommitted changes in the working tree.
+# Intermediate commits are not checked: running the full suite for each one
+# would make pushes too slow. CI checks the tip as well.
 set -e
 root="$(git rev-parse --show-toplevel)"
 zero=0000000000000000000000000000000000000000

@@ -11,9 +11,8 @@ import (
 
 func TestAllow(t *testing.T) {
 	mr := miniredis.RunT(t)
-	l := New(redis.NewClient(&redis.Options{Addr: mr.Addr()}))
 	now := time.Date(2026, 11, 12, 10, 0, 30, 0, time.UTC)
-	l.now = func() time.Time { return now }
+	l := New(redis.NewClient(&redis.Options{Addr: mr.Addr()}), WithClock(func() time.Time { return now }))
 	resetAt := time.Date(2026, 11, 12, 10, 1, 0, 0, time.UTC)
 
 	steps := []struct {

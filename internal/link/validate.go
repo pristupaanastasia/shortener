@@ -41,10 +41,28 @@ func validateURL(raw, ownHost string) error {
 	if u.Host == "" {
 		return fmt.Errorf("%w: host is required", ErrInvalidURL)
 	}
-	if ownHost != "" && strings.EqualFold(u.Host, ownHost) {
+	if ownHost != "" && sameHost(u, ownHost) {
 		return fmt.Errorf("%w: cannot shorten links to this service", ErrInvalidURL)
 	}
 	return nil
+}
+
+// sameHost reports whether u points to ownHost ("host" or "host:port"),
+// ignoring case, a trailing dot and the scheme's default port, so
+// "https://SHO.RT.:443/x" still counts as the service itself.
+func sameHost(u *url.URL, ownHost string) bool {
+	own := &url.URL{Scheme: u.Scheme, Host: ownHost}
+	norm := func(u *url.URL) (string, string) {
+		host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+		port := u.Port()
+		if (u.Scheme == "http" && port == "80") || (u.Scheme == "https" && port == "443") {
+			port = ""
+		}
+		return host, port
+	}
+	h1, p1 := norm(u)
+	h2, p2 := norm(own)
+	return h1 == h2 && (p1 == p2 || p2 == "")
 }
 
 func validateAlias(alias string) error {

@@ -9,7 +9,9 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
@@ -22,22 +24,26 @@ import (
 )
 
 // newFullHandler returns a handler with rate limiting and idempotency backed
-// by an in-process Redis.
+// by an in-process Redis. The limiter's clock is fixed in the middle of a
+// window, so a test never straddles a window boundary.
 func newFullHandler(t *testing.T, anonymousLimit int) *Handler {
 	t.Helper()
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
-	return New(Config{
+	fixed := time.Date(2026, 11, 12, 10, 0, 30, 0, time.UTC)
+	h := New(Config{
 		Links:          link.NewService(memory.New(), "sho.rt"),
 		Accounts:       account.NewService(memory.NewAccounts()),
-		Limiter:        ratelimit.New(rdb),
+		Limiter:        ratelimit.New(rdb, ratelimit.WithClock(func() time.Time { return fixed })),
 		Idempotency:    idempotency.New(rdb, idempotency.DefaultTTL),
 		BaseURL:        "https://sho.rt",
 		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 		AnonymousLimit: anonymousLimit,
 		UserLimit:      1000,
 	})
+	h.now = func() time.Time { return fixed } // for Retry-After
+	return h
 }
 
 type request struct {
@@ -511,5 +517,67 @@ func TestIdempotencyAfterClientDisconnect(t *testing.T) {
 				t.Errorf("Idempotent-Replayed = %v, want %v", got, tt.wantReplayed)
 			}
 		})
+	}
+}
+
+// countingAccounts counts database lookups of API keys.
+type countingAccounts struct {
+	*memory.Accounts
+	lookups atomic.Int32
+}
+
+func (a *countingAccounts) UserByKeyHash(ctx context.Context, hash []byte) (account.User, error) {
+	a.lookups.Add(1)
+	return a.Accounts.UserByKeyHash(ctx, hash)
+}
+
+// Regression: every request looked the key up in the database, even guesses
+// that were already rate limited.
+func TestKeyLookups(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	accounts := &countingAccounts{Accounts: memory.NewAccounts()}
+	fixed := time.Date(2026, 11, 12, 10, 0, 30, 0, time.UTC)
+	h := New(Config{
+		Links:          link.NewService(memory.New(), "sho.rt"),
+		Accounts:       account.NewService(accounts),
+		Limiter:        ratelimit.New(rdb, ratelimit.WithClock(func() time.Time { return fixed })),
+		BaseURL:        "https://sho.rt",
+		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		AnonymousLimit: 2,
+		UserLimit:      100,
+	})
+	key := registerUser(t, h, "alice@example.com")
+	list := func(apiKey, ip string) request {
+		return request{method: "GET", path: "/api/v1/links", apiKey: apiKey, remoteAddr: ip + ":5000"}
+	}
+
+	steps := []struct {
+		name        string
+		req         request
+		wantStatus  int
+		wantLookups int32 // total so far
+	}{
+		{name: "valid key is looked up once", req: list(key, "198.51.100.1"), wantStatus: http.StatusOK, wantLookups: 1},
+		{name: "then served from the cache", req: list(key, "198.51.100.1"), wantStatus: http.StatusOK, wantLookups: 1},
+		{name: "cached key is not limited by the ip quota", req: list(key, "198.51.100.1"), wantStatus: http.StatusOK, wantLookups: 1},
+		{name: "1st guess is looked up", req: list("sk_guess1", "203.0.113.7"), wantStatus: http.StatusUnauthorized, wantLookups: 2},
+		{name: "2nd guess is looked up", req: list("sk_guess2", "203.0.113.7"), wantStatus: http.StatusUnauthorized, wantLookups: 3},
+		{name: "rate limited guess costs no lookup", req: list("sk_guess3", "203.0.113.7"), wantStatus: http.StatusTooManyRequests, wantLookups: 3},
+		{name: "another rate limited guess costs no lookup", req: list("sk_guess4", "203.0.113.7"), wantStatus: http.StatusTooManyRequests, wantLookups: 3},
+	}
+	for _, step := range steps {
+		ok := t.Run(step.name, func(t *testing.T) {
+			if rec := send(h, step.req); rec.Code != step.wantStatus {
+				t.Fatalf("status = %d, want %d; body: %s", rec.Code, step.wantStatus, rec.Body)
+			}
+			if got := accounts.lookups.Load(); got != step.wantLookups {
+				t.Errorf("database lookups = %d, want %d", got, step.wantLookups)
+			}
+		})
+		if !ok {
+			break
+		}
 	}
 }

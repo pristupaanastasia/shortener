@@ -44,19 +44,28 @@ func subjectFrom(ctx context.Context) string {
 
 // api wraps an API handler with authentication and rate limiting.
 //
-// The rate limit is applied before rejecting an invalid API key: otherwise
-// guessing keys would be unlimited. Requests are counted per user when the key
-// is valid, and per client IP otherwise.
+// Requests are counted per user when the key is valid, and per client IP
+// otherwise. A key that is not in the in-memory cache is first counted against
+// the IP quota, before it is looked up in the database: otherwise guessing
+// keys would be unlimited, and every guess would cost a database query even
+// after the client is rate limited.
 func (h *Handler) api(next http.HandlerFunc, mode authMode) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		userID, authErr := h.authenticate(r)
-
-		subject, limit := "ip:"+clientIP(r), h.anonymousLimit
-		if userID != "" {
-			subject, limit = "user:"+userID, h.userLimit
+		ipSubject := "ip:" + clientIP(r)
+		key, hasKey := bearerKey(r)
+		if _, cached := h.accounts.Cached(key); !hasKey || !cached {
+			if !h.checkRateLimit(w, r, ipSubject, h.anonymousLimit) {
+				return
+			}
 		}
-		if !h.checkRateLimit(w, r, subject, limit) {
-			return
+
+		userID, authErr := h.authenticate(r, key, hasKey)
+		subject := ipSubject
+		if userID != "" {
+			subject = "user:" + userID
+			if !h.checkRateLimit(w, r, subject, h.userLimit) {
+				return
+			}
 		}
 
 		switch {
@@ -77,14 +86,27 @@ func (h *Handler) api(next http.HandlerFunc, mode authMode) http.HandlerFunc {
 	}
 }
 
-// authenticate returns the user ID for a valid Bearer key, "" without one.
-func (h *Handler) authenticate(r *http.Request) (string, error) {
+// bearerKey returns the Authorization header's key. hasKey is true whenever
+// the header is set, even with another scheme, which then fails to
+// authenticate.
+func bearerKey(r *http.Request) (key string, hasKey bool) {
 	header := r.Header.Get("Authorization")
 	if header == "" {
+		return "", false
+	}
+	key, _ = strings.CutPrefix(header, "Bearer ")
+	if key == header {
+		return "", true // not a Bearer key
+	}
+	return key, true
+}
+
+// authenticate returns the user ID for a valid key, "" without one.
+func (h *Handler) authenticate(r *http.Request, key string, hasKey bool) (string, error) {
+	if !hasKey {
 		return "", nil
 	}
-	key, ok := strings.CutPrefix(header, "Bearer ")
-	if !ok {
+	if key == "" {
 		return "", account.ErrInvalidKey
 	}
 	u, err := h.accounts.Authenticate(r.Context(), key)
