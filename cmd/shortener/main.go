@@ -10,28 +10,59 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/pristupaanastasia/shortener/internal/httpapi"
 	"github.com/pristupaanastasia/shortener/internal/link"
+	"github.com/pristupaanastasia/shortener/internal/storage/cassandra"
 	"github.com/pristupaanastasia/shortener/internal/storage/memory"
 )
 
 type config struct {
-	addr    string
-	baseURL string
+	addr      string
+	baseURL   string
+	storage   string
+	cassandra cassandra.Config
 }
 
 func loadConfig() (config, error) {
 	cfg := config{
 		addr:    getenv("ADDR", ":8080"),
 		baseURL: getenv("BASE_URL", "http://localhost:8080"),
+		storage: getenv("STORAGE", "memory"),
+		cassandra: cassandra.Config{
+			Hosts:    strings.Split(getenv("CASSANDRA_HOSTS", "127.0.0.1"), ","),
+			Keyspace: getenv("CASSANDRA_KEYSPACE", "shortener"),
+		},
 	}
 	if u, err := url.Parse(cfg.baseURL); err != nil || u.Host == "" {
 		return config{}, fmt.Errorf("BASE_URL %q must be an absolute URL", cfg.baseURL)
 	}
+	rf, err := strconv.Atoi(getenv("CASSANDRA_REPLICATION_FACTOR", "1"))
+	if err != nil {
+		return config{}, fmt.Errorf("CASSANDRA_REPLICATION_FACTOR: %w", err)
+	}
+	cfg.cassandra.ReplicationFactor = rf
 	return cfg, nil
+}
+
+// openStore returns the configured link store and a function that releases it.
+func openStore(ctx context.Context, cfg config) (link.Store, func(), error) {
+	switch cfg.storage {
+	case "memory":
+		return memory.New(), func() {}, nil
+	case "cassandra":
+		s, err := cassandra.Open(ctx, cfg.cassandra)
+		if err != nil {
+			return nil, nil, err
+		}
+		return s, s.Close, nil
+	default:
+		return nil, nil, fmt.Errorf("STORAGE must be memory or cassandra, got %q", cfg.storage)
+	}
 }
 
 func getenv(key, fallback string) string {
@@ -56,7 +87,16 @@ func run(logger *slog.Logger) error {
 	}
 	baseURL, _ := url.Parse(cfg.baseURL)
 
-	links := link.NewService(memory.New(), baseURL.Host)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	store, closeStore, err := openStore(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer closeStore()
+
+	links := link.NewService(store, baseURL.Host)
 	srv := &http.Server{
 		Addr:              cfg.addr,
 		Handler:           httpapi.New(links, cfg.baseURL, logger),
@@ -66,12 +106,9 @@ func run(logger *slog.Logger) error {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
 	errc := make(chan error, 1)
 	go func() {
-		logger.Info("listening", "addr", cfg.addr, "base_url", cfg.baseURL)
+		logger.Info("listening", "addr", cfg.addr, "base_url", cfg.baseURL, "storage", cfg.storage)
 		errc <- srv.ListenAndServe()
 	}()
 

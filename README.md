@@ -365,7 +365,8 @@ CREATE TABLE links_by_user (
    - Custom aliases use a Lightweight Transaction: `INSERT ... IF NOT EXISTS` (Paxos-based, ~4× slower than a regular write; acceptable at 1–3K write RPS).
    - Generated keys use the same check: they are random, so collisions are possible (see [Deep Dive: Key Generation](#deep-dive-key-generation)).
 2. **No queries by arbitrary columns.** `WHERE user_id = ?` on `links` would hit every node, which is why `links_by_user` exists.
-3. **Native TTL is not used.** After a row expires, the redirect would return 404 instead of 410, and the alias would become free, so old links could point to someone else's content. Instead, `expires_at` is checked on read, and expired links are archived by a background job.
+3. **Conditional batches are limited to one partition of one table.** `INSERT ... IF NOT EXISTS` into `links` cannot be batched with the `links_by_user` insert, so the two writes are sequential: the LWT into `links` decides whether the key is taken, then `links_by_user` is written with a plain insert. Verified by an integration test: without `IF NOT EXISTS`, 20 of 20 concurrent inserts of the same key "succeed", silently overwriting each other.
+4. **Native TTL is not used.** After a row expires, the redirect would return 404 instead of 410, and the alias would become free, so old links could point to someone else's content. Instead, `expires_at` is checked on read, and expired links are archived by a background job.
 
 ## High-Level Design
 
@@ -457,7 +458,7 @@ All services are **stateless**: state lives only in the storage layer, so servic
    - URL validation: `http`/`https` scheme, length, not pointing to our own domain (prevents redirect loops);
    - **with alias:** `INSERT ... IF NOT EXISTS` (LWT); 409 if the row already exists;
    - **without alias:** generate a key and insert it with `IF NOT EXISTS`; on collision, retry with a new key.
-3. **Cassandra:** write to `links` and `links_by_user` in one **logged batch**, so both tables are eventually updated together. Consistency `QUORUM` (2 of 3 replicas) to guarantee durability.
+3. **Cassandra:** insert into `links` with `IF NOT EXISTS` (this is what guarantees key uniqueness), then, for links with an owner, a plain insert into `links_by_user`. Both with consistency `QUORUM` (2 of 3 replicas) to guarantee durability. They cannot be combined into one batch: Cassandra rejects conditional batches that span tables.
 4. Respond **201**.
 
 The cache is **not warmed** on creation: most links never become hot, and the first click populates the cache.
@@ -495,12 +496,12 @@ The **Cleanup Worker** runs daily, finds links with `expires_at` in the past and
 
 | Where | Problem | Solution |
 |---|---|---|
-| `links` + `links_by_user` | two tables in one database | logged batch |
+| `links` + `links_by_user` | two tables; the `links` insert is an LWT, and Cassandra does not allow conditional batches across tables | LWT into `links` first, then an idempotent insert into `links_by_user`; if the second write fails, the link still works and the request is retried (with `Idempotency-Key`) |
 | Create → Redis | none: the cache is populated lazily | — |
 | Clicks → Kafka | no database write involved; losing an event is acceptable | async fire-and-forget |
 | Update/delete → `DEL` in Redis | real dual write: if `DEL` fails, the cache serves the old URL until TTL | retry with backoff + cache TTL capped at 1 hour (or CDC-based invalidation) |
 
-**Transactional outbox is not needed here.** It solves a different problem: an event that **must not be lost** and is produced by a database write (e.g. "link created" for a phishing scanner or billing). If such an event appears, it would be written to an `outbox` table in the same logged batch and relayed to Kafka. With Cassandra, CDC is usually preferred over an outbox table, since processed and deleted rows leave tombstones that slow down reads.
+**Transactional outbox is not needed here.** It solves a different problem: an event that **must not be lost** and is produced by a database write (e.g. "link created" for a phishing scanner or billing). If such an event appears, it would be written to an `outbox` table and relayed to Kafka (since the `links` insert is an LWT, it cannot share a batch with it either). With Cassandra, CDC is usually preferred over an outbox table, since processed and deleted rows leave tombstones that slow down reads.
 
 ### Open Questions for the Deep Dive
 

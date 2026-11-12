@@ -17,10 +17,10 @@ Each milestone produces a working service. Work in order; the user reviews each 
 
 ## M2: Cassandra Storage
 
-- [ ] `docker-compose.yml` with Cassandra; schema from `README.md` applied on startup
-- [ ] Cassandra `LinkStore`: `links` + `links_by_user` in a logged batch, `IF NOT EXISTS`, `QUORUM` writes and reads
-- [ ] Store is selected by config (`STORAGE=memory|cassandra`)
-- [ ] Integration tests (`integration` build tag) against the compose Cassandra
+- [x] `docker-compose.yml` with Cassandra; schema from `README.md` applied on startup
+- [x] Cassandra `LinkStore`: `IF NOT EXISTS` into `links`, then `links_by_user` (a conditional batch cannot span tables, see `README.md`), `QUORUM` writes and reads
+- [x] Store is selected by config (`STORAGE=memory|cassandra`)
+- [x] Integration tests (`integration` build tag) against the compose Cassandra
 
 **Done when:** `make check` passes; `make up` + integration tests pass; the service works end to end with `STORAGE=cassandra`.
 

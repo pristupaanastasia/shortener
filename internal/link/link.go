@@ -25,6 +25,7 @@ var ErrKeyTaken = errors.New("key already exists")
 type Link struct {
 	Key       string
 	LongURL   string
+	UserID    string // empty for anonymous links
 	CreatedAt time.Time
 	ExpiresAt *time.Time // nil: never expires
 	DeletedAt *time.Time // nil: not deleted
