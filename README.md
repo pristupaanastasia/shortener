@@ -435,18 +435,27 @@ All services are **stateless**: state lives only in the storage layer, so servic
 ### Flow 1: Redirect (hot path)
 
 1. **Load Balancer** routes `GET sho.rt/abc1234` directly to the Redirect Service, bypassing the API Gateway (no auth needed, every extra hop adds latency).
-2. **Redis** `GET link:abc1234`:
-   - **hit** (most requests): go to step 4;
-   - **miss**: go to step 3.
-3. **Cassandra** `SELECT ... WHERE key = 'abc1234'` with consistency `ONE` (fastest, eventual consistency is acceptable). The result is cached in Redis with `TTL = min(1h, expires_at - now)`.
-   - **Negative caching:** a missing key is also cached as "not found" for 1–5 minutes. Otherwise a bot enumerating random keys would bypass the cache and flood Cassandra.
+2. **Cache lookup**, two levels:
+   - **L1:** an in-process LRU (100K entries, TTL 10s). A viral link is served from memory on every instance instead of hammering a single Redis shard (hot key);
+   - **L2:** Redis `GET link:abc1234`;
+   - **hit** (most requests): go to step 4; **miss**: go to step 3.
+3. **Cassandra** `SELECT ... WHERE key = 'abc1234'` with consistency `QUORUM`. With `QUORUM` writes, `W + R > N` guarantees the read sees the latest write; with `ONE`, a miss could load a stale replica into the cache for an hour. Misses are a small fraction of traffic, so the extra cost is affordable.
+   - Concurrent misses for the same key on one instance are collapsed into one Cassandra read (`singleflight`), which prevents a cache stampede when a hot key expires.
+   - The result is cached in Redis with `TTL = 1h + random(0, 10m)`. The jitter keeps entries that were cached together from expiring together (cache avalanche). Expired and deleted links are cached too: the service checks `expires_at`/`deleted_at` on every read, so 410 is served from cache.
+   - **Negative caching:** a missing key is cached as "not found" for 1 minute. Otherwise a bot enumerating random keys would bypass the cache and flood Cassandra. Creating a link drops its negative entry, so a new alias resolves immediately (other instances' L1 may serve 404 for up to 10s).
+   - **Redis failures are treated as misses**, never as errors. The Redis client uses tight timeouts and minimal retries: with library defaults, an unavailable Redis added ~5 s to every request (measured in tests).
 4. **Checks and response:**
    - `deleted_at` set or `expires_at` in the past: **410**;
    - not found: **404**;
    - otherwise: **301** + `Location` + `Cache-Control: private, max-age=N`.
 5. **Click event to Kafka**, asynchronously. The response does not wait for Kafka: the producer buffers events in memory and sends them in batches. If Kafka is unavailable, the event is dropped: redirects are more important than analytics.
 
-**Latency:** Redis ~1 ms, Cassandra on a miss ~5–10 ms, well within the 100 ms budget.
+**Latency** (measured locally): L1 hit ~0.3 ms, cache miss to Cassandra ~5 ms, Redis down ~10 ms on the first miss, then L1 again. Well within the 100 ms budget.
+
+**Known limitations:**
+
+- A Redis that hangs (accepts connections but does not respond) costs up to the 50 ms timeout per operation. A circuit breaker would skip Redis entirely after repeated failures.
+- While Redis is down, every miss logs a warning; at production traffic, these logs need rate limiting.
 
 ### Flow 2: Create a link
 
@@ -468,7 +477,7 @@ The cache is **not warmed** on creation: most links never become hot, and the fi
 1. API Gateway: auth, rate limit.
 2. Link Service checks that the link's `user_id` matches the API key owner; otherwise 404.
 3. Update both Cassandra tables with `QUORUM`.
-4. `DEL link:abc1234` in Redis: the next click reads fresh data from Cassandra.
+4. Invalidate the cache with a **delayed double delete**: `DEL link:abc1234` in Redis and L1, and again after ~1 s. The second delete removes a stale value written back by a concurrent reader that loaded it from Cassandra before the update. Other instances' L1 entries expire within 10 s.
 5. Browsers pick up the change within ≤ 90 seconds (`max-age`).
 
 This is the **cache-aside** pattern: the application reads the cache, falls back to the database on a miss and invalidates the cache on writes.

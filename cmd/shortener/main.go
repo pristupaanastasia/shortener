@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pristupaanastasia/shortener/internal/cache"
 	"github.com/pristupaanastasia/shortener/internal/httpapi"
 	"github.com/pristupaanastasia/shortener/internal/link"
 	"github.com/pristupaanastasia/shortener/internal/storage/cassandra"
@@ -26,13 +27,15 @@ type config struct {
 	baseURL   string
 	storage   string
 	cassandra cassandra.Config
+	redisAddr string // empty: no cache
 }
 
 func loadConfig() (config, error) {
 	cfg := config{
-		addr:    getenv("ADDR", ":8080"),
-		baseURL: getenv("BASE_URL", "http://localhost:8080"),
-		storage: getenv("STORAGE", "memory"),
+		addr:      getenv("ADDR", ":8080"),
+		baseURL:   getenv("BASE_URL", "http://localhost:8080"),
+		storage:   getenv("STORAGE", "memory"),
+		redisAddr: os.Getenv("REDIS_ADDR"),
 		cassandra: cassandra.Config{
 			Hosts:    strings.Split(getenv("CASSANDRA_HOSTS", "127.0.0.1"), ","),
 			Keyspace: getenv("CASSANDRA_KEYSPACE", "shortener"),
@@ -96,6 +99,17 @@ func run(logger *slog.Logger) error {
 	}
 	defer closeStore()
 
+	if cfg.redisAddr != "" {
+		rdb := cache.NewRedisClient(cfg.redisAddr)
+		defer rdb.Close()
+		cached := cache.New(store, rdb, cache.DefaultConfig(), logger)
+		// Redis is optional at runtime, so an unreachable one is only a warning.
+		if err := cached.Ping(ctx); err != nil {
+			logger.Warn("redis unavailable, serving from storage until it recovers", "err", err)
+		}
+		store = cached
+	}
+
 	links := link.NewService(store, baseURL.Host)
 	srv := &http.Server{
 		Addr:              cfg.addr,
@@ -108,7 +122,7 @@ func run(logger *slog.Logger) error {
 
 	errc := make(chan error, 1)
 	go func() {
-		logger.Info("listening", "addr", cfg.addr, "base_url", cfg.baseURL, "storage", cfg.storage)
+		logger.Info("listening", "addr", cfg.addr, "base_url", cfg.baseURL, "storage", cfg.storage, "cache", cfg.redisAddr != "")
 		errc <- srv.ListenAndServe()
 	}()
 

@@ -17,5 +17,18 @@ services:
       retries: 30
       start_period: 30s
 
+  redis:
+    image: redis:7.4
+    ports:
+      - "6379:6379"
+    # A cache, not a database: bounded memory, evict the least frequently
+    # used keys, no persistence.
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lfu", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
 volumes:
   cassandra-data:
