@@ -19,6 +19,27 @@ ctx=(--context "$profile")
 ns=(--namespace shortener)
 image=shortener:dev
 
+# port_forward TARGET PORT... starts a port-forward in the background (pf),
+# waits until /healthz answers through the first port, and fails if the
+# port-forward dies (e.g. a leftover one still holds the port).
+port_forward() {
+	local target="$1" log
+	shift
+	log="$(mktemp)"
+	kubectl "${ctx[@]}" "${ns[@]}" port-forward "$target" "$@" >"$log" 2>&1 &
+	pf=$!
+	local local_port="${1%%:*}"
+	for _ in $(seq 1 30); do
+		kill -0 "$pf" 2>/dev/null || { echo "port-forward failed:" >&2; cat "$log" >&2; exit 1; }
+		curl -sf "http://127.0.0.1:$local_port/healthz" >/dev/null 2>&1 && return 0
+		sleep 0.5
+	done
+	echo "the service did not answer through the port-forward within 15s" >&2
+	exit 1
+}
+pf=""
+trap 'kill "${pf:-}" 2>/dev/null || true' EXIT
+
 case "${1:-}" in
 up)
 	minikube start -p "$profile" --driver=docker --memory=2048 --cpus=2 --addons=metrics-server
@@ -33,33 +54,30 @@ deploy)
 	kubectl "${ctx[@]}" "${ns[@]}" rollout status deploy/consumer --timeout=180s
 	;;
 smoke)
-	# One port-forward for both ports, so they reach the same pod.
-	kubectl "${ctx[@]}" "${ns[@]}" port-forward svc/shortener 18080:80 19091:9091 >/dev/null 2>&1 &
-	pf=$!
-	trap 'kill "$pf" 2>/dev/null || true' EXIT
-	for _ in $(seq 1 30); do
-		curl -sf http://127.0.0.1:18080/healthz >/dev/null 2>&1 && break
-		sleep 0.5
-	done
+	# One port-forward for both ports, so they reach the same pod. The
+	# metrics port is not in the Service, so forward to a pod of the
+	# Deployment.
+	port_forward deploy/shortener 18080:8080 19091:9091
 	SMOKE_URL=http://127.0.0.1:18080 SMOKE_METRICS_URL=http://127.0.0.1:19091 SMOKE_ANALYTICS=1 \
 		./scripts/smoke.sh
 	;;
 rollout)
+	# Whatever happens, stop the port-forward and remove the loadgen pod.
+	trap 'kill "${pf:-}" 2>/dev/null || true; kubectl "${ctx[@]}" "${ns[@]}" delete pod loadgen --ignore-not-found --wait=false >/dev/null 2>&1 || true' EXIT
 	# A link to request: created through a short-lived port-forward.
-	kubectl "${ctx[@]}" "${ns[@]}" port-forward svc/shortener 18080:80 >/dev/null 2>&1 &
-	pf=$!
-	for _ in $(seq 1 30); do curl -sf http://127.0.0.1:18080/healthz >/dev/null 2>&1 && break; sleep 0.5; done
+	port_forward svc/shortener 18080:80
 	alias="rollout$(date +%s)"
 	body="{\"long_url\":\"https://example.com/rollout\",\"alias\":\"$alias\"}"
 	curl -sf -o /dev/null -X POST http://127.0.0.1:18080/api/v1/links -d "$body"
 	kill "$pf"
+	pf=""
 
 	# The load must come from inside the cluster, through the Service: a
 	# port-forward is bound to one pod and breaks when that pod restarts.
 	docker build -q -t shortener-loadgen:dev -f- . >/dev/null <<'DOCKERFILE'
-FROM golang:1.26 AS build
+FROM golang:1.26.3@sha256:2d6c80227255c3112a4d08e67ba98e58efd3846daf15d9d7d4c389565d881b1a AS build
 RUN CGO_ENABLED=0 GOBIN=/out go install github.com/tsenart/vegeta/v12@v12.13.0
-FROM busybox:1.37
+FROM busybox:1.37@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec
 COPY --from=build /out/vegeta /usr/local/bin/vegeta
 DOCKERFILE
 	minikube -p "$profile" image load --overwrite shortener-loadgen:dev

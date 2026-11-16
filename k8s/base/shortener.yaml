@@ -3,7 +3,8 @@ kind: Deployment
 metadata:
   name: shortener
 spec:
-  replicas: 3
+  # No replicas: the HPA owns scaling, and a replicas field here would be
+  # reset on every apply. The HPA's minReplicas sets the floor.
   selector:
     matchLabels:
       app.kubernetes.io/name: shortener
@@ -86,12 +87,12 @@ spec:
   selector:
     app.kubernetes.io/name: shortener
   ports:
+    # Only traffic: /metrics and /debug/pprof stay off the Service.
+    # Prometheus scrapes pods directly (annotations above); restricting pod
+    # access to port 9091 needs a NetworkPolicy in a real cluster.
     - name: http
       port: 80
       targetPort: http
-    - name: metrics
-      port: 9091
-      targetPort: metrics
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler

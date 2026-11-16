@@ -20,13 +20,16 @@ configMapGenerator:
       - REDIS_ADDR=redis:6379
       - KAFKA_BROKERS=kafka:9092
       - ADDR=:8080
-      # Inside the pod: the pod network is isolated, and Prometheus scrapes
-      # this port.
+      # On all pod interfaces, for Prometheus to scrape the pods. It is not
+      # in the Service; without a NetworkPolicy, other pods can still reach
+      # the pod IP.
       - METRICS_ADDR=:9091
       - BASE_URL=https://sho.rt
 secretGenerator:
   # Declared here (empty) so that the Deployments' references follow the
-  # generated name; every overlay fills it with behavior: merge.
+  # generated name; every overlay must fill it with behavior: merge. The base
+  # alone does not run: the shortener refuses to start without POSTGRES_DSN
+  # and the consumer without a reachable ClickHouse.
   - name: shortener-secrets
     literals:
       - POSTGRES_DSN=

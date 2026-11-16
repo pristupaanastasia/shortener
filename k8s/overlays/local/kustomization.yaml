@@ -13,7 +13,8 @@ configMapGenerator:
       - REDIS_ADDR=host.minikube.internal:6379
       # The external listener: the default one advertises localhost.
       - KAFKA_BROKERS=host.minikube.internal:9094
-      - BASE_URL=http://localhost:8080
+      # The port-forward of scripts/k8s.sh, so returned short_url values work.
+      - BASE_URL=http://127.0.0.1:18080
       # The smoke test makes many anonymous requests from one IP.
       - RATE_LIMIT_ANONYMOUS=1000
 secretGenerator:
@@ -30,13 +31,6 @@ patches:
       - op: add
         path: /spec/template/spec/containers/0/imagePullPolicy
         value: Never
-  - target:
-      kind: Deployment
-      name: shortener
-    patch: |-
-      - op: replace
-        path: /spec/replicas
-        value: 2
   - target:
       kind: HorizontalPodAutoscaler
     patch: |-

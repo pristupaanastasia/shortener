@@ -692,8 +692,8 @@ Manifests are in `k8s/` (kustomize). `k8s/base` describes the service in any clu
 
 | Object | Purpose |
 |---|---|
-| `Deployment/shortener` | the API and redirects; 3 replicas, `maxUnavailable: 0` so rollouts never drop below capacity |
-| `Service/shortener` | port 80 → 8080 for traffic, 9091 for Prometheus (`/metrics`, `/debug/pprof`; the pod network is isolated, so the metrics server listens on all pod interfaces) |
+| `Deployment/shortener` | the API and redirects; no `replicas` field (the HPA owns scaling, and an applied `replicas` would reset it), `maxUnavailable: 0` so rollouts never drop below capacity |
+| `Service/shortener` | port 80 → 8080, traffic only: `/metrics` and `/debug/pprof` (9091) are not in the Service. Prometheus scrapes the pods directly, so the metrics server listens on all pod interfaces; in a real cluster, a NetworkPolicy should limit port 9091 to the monitoring namespace |
 | `HorizontalPodAutoscaler/shortener` | 3–20 replicas at 70% CPU: the load test measured ~23K redirects/s per core |
 | `PodDisruptionBudget/shortener` | node drains take at most one pod at a time |
 | `Deployment/consumer` | the analytics consumer; replicas up to the number of partitions of the clicks topic |
@@ -701,7 +701,8 @@ Manifests are in `k8s/` (kustomize). `k8s/base` describes the service in any clu
 
 **Pod design:**
 
-- The image is distroless and runs as UID 65532 with a read-only root filesystem and all capabilities dropped (55 MB, both binaries). A numeric UID is required for `runAsNonRoot` to be verifiable.
+- The image is distroless and runs as UID 65532 with a read-only root filesystem and all capabilities dropped (55 MB, both binaries). A numeric UID is required for `runAsNonRoot` to be verifiable. Base images are pinned by version and digest.
+- `k8s/base` does not run on its own: the overlay must provide the Secret. The shortener refuses `STORAGE=cassandra` without `POSTGRES_DSN`, because per-instance in-memory accounts would look healthy but reject keys registered on another instance.
 - Probes: a startup probe covers connecting to the databases and applying migrations; readiness and liveness use `/healthz`.
 - **Graceful shutdown:** `preStop: sleep 5s` keeps the pod serving while it is removed from the Service's endpoints; only then does it get SIGTERM and drain in-flight requests (10 s). Verified with `make k8s-rollout`: a rolling restart under 200 requests/s from inside the cluster loses no requests (9000 of 9000 succeeded); without the `preStop` pause, the same check failed a request.
 
