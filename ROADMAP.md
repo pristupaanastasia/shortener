@@ -78,3 +78,13 @@ The first bottleneck in the code found by the M6 load test: two Redis round trip
 - [x] Measure again with the same load and update the "Load Test Results" section in `README.md`
 
 **Done when:** `make check`, `make coverage` and `make loadtest` pass; the CPU profile at 10K creates/s shows the rate limiter and the `DEL` reduced, with before/after numbers in `README.md`.
+
+## M8: Kubernetes
+
+- [ ] `Dockerfile`: multi-stage build, distroless non-root image with `shortener` and `consumer`
+- [ ] `k8s/base` (kustomize): shortener Deployment (replicas, readiness/liveness probes, resource requests/limits, graceful shutdown), Service, consumer Deployment, HorizontalPodAutoscaler, PodDisruptionBudget, config in a ConfigMap and secrets in a Secret
+- [ ] `k8s/overlays/local`: a minikube profile `shortener`, dependencies from `make up` reached via `host.minikube.internal`
+- [ ] `make k8s-up` / `k8s-deploy` / `k8s-smoke` / `k8s-down`; every kubectl call uses an explicit `--context`, never the current one
+- [ ] The smoke test can run against an already running service (`SMOKE_URL`), and `make k8s-smoke` runs it through a port-forward
+
+**Done when:** `make k8s-up k8s-deploy k8s-smoke` brings the service up in minikube and the smoke test passes against it, including click statistics; a rolling restart (`kubectl rollout restart`) under load loses no requests.
