@@ -141,11 +141,12 @@ func TestHookRecovers(t *testing.T) {
 	tests := []struct {
 		name      string
 		recovered bool
-		wantErr   bool
+		wantErr   error // nil: success
 		wantState State
 	}{
 		{name: "probe through a new connection closes it", recovered: true, wantState: Closed},
-		{name: "probe against a dead Redis reopens it", recovered: false, wantErr: true, wantState: Open},
+		// Callers skip logging it: the breaker has logged the outage.
+		{name: "probe against a dead Redis reopens it", recovered: false, wantErr: ErrProbeFailed, wantState: Open},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -163,8 +164,8 @@ func TestHookRecovers(t *testing.T) {
 			}
 			*now = now.Add(time.Second)
 			got, err := rdb.Get(t.Context(), "k").Result()
-			if (err != nil) != tt.wantErr {
-				t.Fatalf("Get after the cooldown = %q, %v; want error: %v", got, err, tt.wantErr)
+			if (err == nil) != (tt.wantErr == nil) || (tt.wantErr != nil && !errors.Is(err, tt.wantErr)) {
+				t.Fatalf("Get after the cooldown = %q, %v; want error %v", got, err, tt.wantErr)
 			}
 			if b.State() != tt.wantState {
 				t.Errorf("State() = %v, want %v", b.State(), tt.wantState)

@@ -246,9 +246,12 @@ func (s *Store) Invalidate(ctx context.Context, key string) {
 	})
 }
 
+// drop removes key from both levels. The Redis delete bypasses the circuit
+// breaker: a delete dropped while it is open would leave a stale entry that
+// redirects serve for its whole TTL once Redis answers again.
 func (s *Store) drop(ctx context.Context, key string) {
 	s.l1.Remove(key)
-	if err := s.redis.Del(ctx, redisKey(key)).Err(); err != nil {
+	if err := s.redis.Del(breaker.Bypass(ctx), redisKey(key)).Err(); err != nil {
 		s.warnRedis("cache delete failed", key, err)
 	}
 }
@@ -286,7 +289,7 @@ func (s *Store) setRedis(ctx context.Context, key string, e entry) {
 // warnRedis logs a Redis failure, except while the circuit breaker is open:
 // the breaker logs that once, and a warning per call would flood the log.
 func (s *Store) warnRedis(msg, key string, err error) {
-	if errors.Is(err, breaker.ErrOpen) {
+	if breaker.Quiet(err) {
 		return
 	}
 	s.logger.Warn(msg, "key", key, "err", err)

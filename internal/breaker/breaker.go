@@ -17,6 +17,17 @@ import (
 // wait and without logging every call.
 var ErrOpen = errors.New("circuit breaker open")
 
+// ErrProbeFailed wraps the error of a half-open probe that failed: the call
+// did reach the dependency (unlike ErrOpen), but the breaker has logged the
+// outage already, so callers stay quiet about it too.
+var ErrProbeFailed = errors.New("circuit breaker probe failed")
+
+// Quiet reports whether a caller should skip logging err: the breaker is open
+// or its probe failed, and the breaker logs the outage once.
+func Quiet(err error) bool {
+	return errors.Is(err, ErrOpen) || errors.Is(err, ErrProbeFailed)
+}
+
 // State is the breaker's state.
 type State int
 
@@ -44,7 +55,9 @@ type Config struct {
 	Failures int
 	// Cooldown is how long the breaker stays open before a probe.
 	Cooldown time.Duration
-	// OnChange, if set, is called on every state change, outside the lock.
+	// OnChange, if set, is called on every state change, in order. It runs
+	// under the breaker's lock, so it must be quick and must not call the
+	// breaker.
 	OnChange func(from, to State)
 }
 
@@ -91,54 +104,59 @@ const (
 // Allow reports whether a call may proceed. When it returns true, the caller
 // must report the outcome with Done.
 func (b *Breaker) Allow() bool {
+	allowed, _ := b.allow()
+	return allowed
+}
+
+// allow is Allow that also reports whether the call is the half-open probe.
+func (b *Breaker) allow() (allowed, probe bool) {
 	b.mu.Lock()
-	var from, to State
-	allowed := true
+	defer b.mu.Unlock()
 	switch b.state {
 	case Closed:
+		return true, false
 	case HalfOpen:
-		allowed = false // a probe is already in flight
-	case Open:
+		return false, false // a probe is already in flight
+	default:
 		if b.now().Sub(b.openedAt) < b.cfg.Cooldown {
-			allowed = false
-		} else {
-			from, to = b.state, HalfOpen
-			b.state = HalfOpen // this call is the probe
+			return false, false
 		}
+		b.setState(HalfOpen) // this call is the probe
+		return true, true
 	}
-	b.mu.Unlock()
-	b.notify(from, to)
-	return allowed
 }
 
 // Done records the outcome of a call that Allow let through.
 func (b *Breaker) Done(o Outcome) {
 	b.mu.Lock()
-	from := b.state
+	defer b.mu.Unlock()
 	switch {
 	case o == Ignored:
 		if b.state == HalfOpen {
 			// The probe told nothing: open again with the cooldown already
 			// over, so the next call probes.
-			b.state = Open
+			b.setState(Open)
 		}
 	case o == Success:
 		b.failures = 0
-		b.state = Closed
+		b.setState(Closed)
 	case b.state == HalfOpen:
-		b.state, b.openedAt = Open, b.now() // the probe failed
+		b.openedAt = b.now() // the probe failed
+		b.setState(Open)
 	default:
 		b.failures++
 		if b.failures >= b.cfg.Failures {
-			b.state, b.openedAt, b.failures = Open, b.now(), 0
+			b.openedAt, b.failures = b.now(), 0
+			b.setState(Open)
 		}
 	}
-	to := b.state
-	b.mu.Unlock()
-	b.notify(from, to)
 }
 
-func (b *Breaker) notify(from, to State) {
+// setState changes the state and notifies OnChange; b.mu must be held, which
+// keeps notifications in the order of the changes.
+func (b *Breaker) setState(to State) {
+	from := b.state
+	b.state = to
 	if from != to && b.cfg.OnChange != nil {
 		b.cfg.OnChange(from, to)
 	}

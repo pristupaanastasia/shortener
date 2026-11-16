@@ -2,6 +2,7 @@ package breaker
 
 import (
 	"slices"
+	"sync"
 	"testing"
 	"time"
 )
@@ -128,6 +129,51 @@ func TestBreakerOnChange(t *testing.T) {
 			}
 			if !slices.Equal(got, tt.want) {
 				t.Errorf("changes = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// Regression: OnChange ran after the lock was released, so racing changes
+// could be reported out of order (e.g. "closed" then "open" while the
+// breaker was closed).
+func TestBreakerOnChangeOrder(t *testing.T) {
+	tests := []struct {
+		name       string
+		goroutines int
+		calls      int
+	}{
+		{name: "flaky dependency, many callers", goroutines: 8, calls: 2000},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			type change struct{ from, to State }
+			var got []change
+			b := New(Config{Failures: 1, Cooldown: 0, OnChange: func(from, to State) {
+				got = append(got, change{from, to}) // under the breaker's lock
+				time.Sleep(time.Microsecond)        // widen any race window
+			}})
+			var wg sync.WaitGroup
+			for g := range tt.goroutines {
+				wg.Go(func() {
+					for i := range tt.calls {
+						if b.Allow() {
+							b.Done(Outcome((g + i) % 2)) // Success and Failure alternate
+						}
+					}
+				})
+			}
+			wg.Wait()
+			if len(got) == 0 {
+				t.Fatal("no state changes")
+			}
+			for i := 1; i < len(got); i++ {
+				if got[i].from != got[i-1].to {
+					t.Fatalf("change %d: %v->%v follows %v->%v", i, got[i].from, got[i].to, got[i-1].from, got[i-1].to)
+				}
+			}
+			if last := got[len(got)-1].to; last != b.State() {
+				t.Errorf("last reported state = %v, actual %v", last, b.State())
 			}
 		})
 	}

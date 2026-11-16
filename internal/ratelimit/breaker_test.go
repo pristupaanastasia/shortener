@@ -13,23 +13,26 @@ import (
 	"github.com/pristupaanastasia/shortener/internal/breaker"
 )
 
-// With the Redis circuit breaker open, a flush fails at once: the counts stay
-// local until a later flush, and nothing is logged per flush.
+// With the Redis circuit breaker open, a flush fails at once and nothing is
+// logged; the counts were never sent, so the next flush after recovery sends
+// them. Regression: they were booked as unconfirmed and never reached Redis,
+// so other instances undercounted for the rest of the window.
 func TestBatchedBreakerOpen(t *testing.T) {
 	tests := []struct {
 		name      string
 		open      bool
 		wantLog   bool
-		wantRedis string // count in Redis after the flush
+		wantRedis string // count in Redis after the first flush
 	}{
 		{name: "closed breaker syncs", open: false, wantLog: false, wantRedis: "3"},
 		{name: "open breaker keeps counts local without logging", open: true, wantLog: false, wantRedis: ""},
 	}
+	const cooldown = 20 * time.Millisecond
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mr := miniredis.RunT(t)
 			now := time.Date(2026, 11, 12, 10, 0, 30, 0, time.UTC)
-			cb := breaker.New(breaker.Config{Failures: 1, Cooldown: time.Hour})
+			cb := breaker.New(breaker.Config{Failures: 1, Cooldown: cooldown})
 			if tt.open {
 				cb.Allow()
 				cb.Done(breaker.Failure)
@@ -54,6 +57,13 @@ func TestBatchedBreakerOpen(t *testing.T) {
 			// Still counted locally either way.
 			if r, _ := b.Allow(context.Background(), "ip:1.2.3.4", 10, time.Minute); r.Remaining != last.Remaining-1 {
 				t.Errorf("Remaining = %d, want %d", r.Remaining, last.Remaining-1)
+			}
+			// After the cooldown, the next flush is the probe: all 4 requests
+			// reach Redis.
+			time.Sleep(2 * cooldown)
+			b.flush(context.Background())
+			if got := redisCount(mr, "ip:1.2.3.4", now); got != "4" {
+				t.Errorf("count in Redis after recovery = %q, want %q", got, "4")
 			}
 		})
 	}

@@ -208,7 +208,9 @@ func (h *Handler) withIdempotency(w http.ResponseWriter, r *http.Request, handle
 
 	// Store the outcome even if the client has gone away: a client that timed
 	// out is exactly the one that will retry.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Second)
+	// It bypasses the Redis circuit breaker: a dropped write would leave the
+	// key pending, and retries would get 409 until it expires.
+	ctx, cancel := context.WithTimeout(breaker.Bypass(context.WithoutCancel(r.Context())), 2*time.Second)
 	defer cancel()
 
 	// A server error may be transient: release the key so a retry runs again.
@@ -251,7 +253,7 @@ func (r *recorder) flush(w http.ResponseWriter) {
 // circuit breaker is open: the breaker logs that once, and a warning per
 // request would flood the log.
 func (h *Handler) warnRedis(msg string, err error) {
-	if errors.Is(err, breaker.ErrOpen) {
+	if breaker.Quiet(err) {
 		return
 	}
 	h.logger.Warn(msg, "err", err)
