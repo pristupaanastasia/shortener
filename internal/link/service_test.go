@@ -13,7 +13,7 @@ import (
 // mapStore is a minimal Store for service tests.
 type mapStore map[string]Link
 
-func (m mapStore) Create(_ context.Context, l Link) error {
+func (m mapStore) Create(_ context.Context, l Link, _ CreateOptions) error {
 	if _, ok := m[l.Key]; ok {
 		return ErrKeyTaken
 	}
@@ -363,10 +363,10 @@ type lockedStore struct {
 	m  mapStore
 }
 
-func (s *lockedStore) Create(ctx context.Context, l Link) error {
+func (s *lockedStore) Create(ctx context.Context, l Link, opts CreateOptions) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.m.Create(ctx, l)
+	return s.m.Create(ctx, l, opts)
 }
 
 func (s *lockedStore) Get(ctx context.Context, key string) (Link, error) {
@@ -453,6 +453,41 @@ func TestUpdateWithStaleRead(t *testing.T) {
 			got := m["alice01"]
 			if got.LongURL != tt.wantURL || (got.ExpiresAt != nil) != tt.wantExpires || (got.DeletedAt != nil) != tt.wantDeleted {
 				t.Errorf("stored = %+v, want url %s, expiry %v, deleted %v", got, tt.wantURL, tt.wantExpires, tt.wantDeleted)
+			}
+		})
+	}
+}
+
+// optsStore records the CreateOptions of the last Create.
+type optsStore struct {
+	mapStore
+	last CreateOptions
+}
+
+func (s *optsStore) Create(ctx context.Context, l Link, opts CreateOptions) error {
+	s.last = opts
+	return s.mapStore.Create(ctx, l, opts)
+}
+
+// A cache skips dropping a negative entry for generated keys only; an alias
+// marked as generated would keep serving 404 after it is created.
+func TestCreatePassesGeneratedKey(t *testing.T) {
+	tests := []struct {
+		name          string
+		params        CreateParams
+		wantGenerated bool
+	}{
+		{name: "alias", params: CreateParams{LongURL: "https://example.com", Alias: "sale2026"}, wantGenerated: false},
+		{name: "generated key", params: CreateParams{LongURL: "https://example.com"}, wantGenerated: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &optsStore{mapStore: mapStore{}}
+			if _, err := newTestService(store).Create(context.Background(), tt.params); err != nil {
+				t.Fatal(err)
+			}
+			if store.last.GeneratedKey != tt.wantGenerated {
+				t.Errorf("GeneratedKey = %v, want %v", store.last.GeneratedKey, tt.wantGenerated)
 			}
 		})
 	}

@@ -26,7 +26,7 @@ func New() *Store {
 }
 
 // Create implements link.Store.
-func (s *Store) Create(_ context.Context, l link.Link) error {
+func (s *Store) Create(_ context.Context, l link.Link, _ link.CreateOptions) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.links[l.Key]; ok {

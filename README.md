@@ -143,11 +143,12 @@ The network is not a bottleneck.
   When the limit is exceeded, the service returns `429 Too Many Requests` with `Retry-After: <seconds>`.
 
   Implementation details:
-  - **Fixed window** of one minute, a counter per subject in Redis (`INCR` + `EXPIRE` in one transaction), shared by all instances. The simplest algorithm; the trade-off is a burst of up to 2× the limit around a window boundary.
+  - **Fixed window** of one minute, a counter per subject in Redis, shared by all instances. The simplest algorithm; the trade-off is a burst of up to 2× the limit around a window boundary.
+  - **Counted in memory, synced in batches** (`RATE_LIMIT_SYNC_INTERVAL`, default 100 ms): each instance decides locally from the last global count it read plus its own unsynced requests, and flushes its increments to Redis (`INCRBY` + `EXPIRE` in one pipeline) every interval. This removes the per-request Redis transaction (12.8% of service CPU at 10K creates/s). The cost is accuracy: instances learn about each other's requests only when they sync, so together they can admit up to one sync round's worth of extra requests per window (the interval plus the flush's round trip). Requests in flight to Redis stay counted, so a slow Redis does not hand out a fresh quota on every flush. `RATE_LIMIT_SYNC_INTERVAL=0` restores exact per-request counting.
   - **Limits:** 100 requests/min per user, 10 requests/min per IP for requests without a valid API key (configurable with `RATE_LIMIT_USER` and `RATE_LIMIT_ANONYMOUS`).
   - The limit is checked **before** an invalid API key is rejected, so guessing keys counts against the IP quota.
   - The client IP is the TCP peer address. `X-Forwarded-For` is not trusted: behind a load balancer, read only the balancer's own header.
-  - If Redis is unavailable, requests are allowed (fail open): rate limiting must not take the API down.
+  - If Redis is unavailable, requests are allowed (fail open): rate limiting must not take the API down. With batched syncing, a failed sync is never resent, since Redis may already have applied it (resending would count those requests twice); its requests stay counted locally until their window ends, so during an outage each instance keeps enforcing limits on its own traffic. Counters of ended windows are dropped even then, so an outage does not grow memory, and large syncs are split into pipelines of 500 counters. The limiter uses its own Redis client without command retries, for the same reason.
   - Redirects (`GET /{key}`) are not rate limited.
 
 ### Endpoints
@@ -487,7 +488,7 @@ All services are **stateless**: state lives only in the storage layer, so servic
 3. **Cassandra** `SELECT ... WHERE key = 'abc1234'` with consistency `QUORUM`. With `QUORUM` writes, `W + R > N` guarantees the read sees the latest write; with `ONE`, a miss could load a stale replica into the cache for an hour. Misses are a small fraction of traffic, so the extra cost is affordable.
    - Concurrent misses for the same key on one instance are collapsed into one Cassandra read (`singleflight`), which prevents a cache stampede when a hot key expires.
    - The result is cached in Redis with `TTL = 1h + random(0, 10m)`. The jitter keeps entries that were cached together from expiring together (cache avalanche). Expired and deleted links are cached too: the service checks `expires_at`/`deleted_at` on every read, so 410 is served from cache.
-   - **Negative caching:** a missing key is cached as "not found" for 1 minute. Otherwise a bot enumerating random keys would bypass the cache and flood Cassandra. Creating a link drops its negative entry, so a new alias resolves immediately (other instances' L1 may serve 404 for up to 10s).
+   - **Negative caching:** a missing key is cached as "not found" for 1 minute. Otherwise a bot enumerating random keys would bypass the cache and flood Cassandra. Creating an alias drops its negative entry, so a new alias resolves immediately (other instances' L1 may serve 404 for up to 10s). For generated keys this Redis round trip is skipped (it was 8.6% of service CPU at 10K creates/s): a random key is practically never looked up before it exists, so the rare stale "not found" lasts at most the 1-minute negative TTL.
    - **Redis failures are treated as misses**, never as errors. The Redis client uses tight timeouts and minimal retries: with library defaults, an unavailable Redis added ~5 s to every request (measured in tests).
 4. **Checks and response:**
    - `deleted_at` set or `expires_at` in the past: **410**;
@@ -673,5 +674,14 @@ The latency requirements (redirect p99 < 100 ms, create p99 < 500 ms) and the > 
 ### Bottlenecks
 
 1. **First bottleneck: the test bed itself.** k6 running in Docker Desktop capped at ~23.4K requests/s and added ~15 ms to p99 through the virtual network, while the service used ~1.1 of 12 cores. The same service with a native generator served 30K/s with p99 1.2 ms. **Addressed:** `make loadtest` now runs vegeta natively and checks the latency requirements itself. At ~50K/s the native generator runs out of ephemeral ports on the client side (`bind: can't assign requested address`), so higher read loads need a load generator on separate machines.
-2. **First bottleneck in the code: Redis round trips on the write path.** At 10K creates/s, the rate limiter's `INCR`+`EXPIRE` transaction takes 15% of the service's CPU and the negative-cache `DEL` on create ~9.5%, against 4% for the Cassandra LWT itself. Not addressed yet, because it only matters at over 3× the design write peak. When it does: count rate limits locally and flush increments to Redis in batches (an approximate limit, trading accuracy for one round trip per batch instead of per request), and skip the negative-cache `DEL` for generated keys (a random key is practically never looked up before it exists; only aliases need it).
+2. **First bottleneck in the code: Redis round trips on the write path.** At 10K creates/s, the rate limiter's per-request `INCR`+`EXPIRE` transaction and the negative-cache `DEL` on create together cost far more CPU than the Cassandra LWT itself. **Addressed in M7:** rate limits are counted in memory and synced to Redis in batches every 100 ms (approximate: instances together can admit up to one sync interval's worth of extra requests), and the `DEL` is skipped for generated keys (a random key is practically never looked up before it exists; aliases still drop their entry). Same load before and after (10K creates/s + 100 redirects/s, one run each):
+
+   | | Before | After |
+   |---|---|---|
+   | Rate limiter, share of service CPU | 12.8% | < 0.1% (no samples, including the sync loop) |
+   | Negative-cache `DEL` | 8.6% | 0% for generated keys |
+   | Cassandra LWT | 4.0% | 5.6% (same work, smaller total) |
+   | Service CPU | 1.54 cores | 1.20 cores (−22%) |
+   | Create latency, mean / p99 | 6.5 / 34.1 ms | 3.1 / 19.7 ms |
+   | Redirect p99 | 8.6 ms | 7.2 ms |
 3. **Next infrastructure limit: the single Cassandra node** at ~3.9 cores for 10K creates/s (Paxos for every LWT). In production, writes spread over a multi-node cluster.

@@ -467,8 +467,8 @@ type cancelingStore struct {
 	cancel context.CancelFunc
 }
 
-func (s *cancelingStore) Create(ctx context.Context, l link.Link) error {
-	err := s.Store.Create(ctx, l)
+func (s *cancelingStore) Create(ctx context.Context, l link.Link, opts link.CreateOptions) error {
+	err := s.Store.Create(ctx, l, opts)
 	s.cancel()
 	return err
 }

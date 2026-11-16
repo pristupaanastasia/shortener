@@ -62,7 +62,7 @@ func TestMigrations(t *testing.T) {
 					t.Errorf("table %s missing; tables = %v", want, tables)
 				}
 			}
-			if err := s.Create(ctx, l); err != nil {
+			if err := s.Create(ctx, l, link.CreateOptions{}); err != nil {
 				t.Fatalf("the migrated schema rejects a link: %v", err)
 			}
 		}},

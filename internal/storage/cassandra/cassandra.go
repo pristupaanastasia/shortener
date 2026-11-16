@@ -158,7 +158,7 @@ func applyMigrations(ctx context.Context, session *gocql.Session) error {
 // The insert into links is a lightweight transaction, which guarantees key
 // uniqueness. Cassandra does not allow a conditional batch to span tables,
 // so links_by_user is written afterwards with a plain, idempotent insert.
-func (s *Store) Create(ctx context.Context, l link.Link) error {
+func (s *Store) Create(ctx context.Context, l link.Link, _ link.CreateOptions) error {
 	userID, err := parseUserID(l.UserID)
 	if err != nil {
 		return err

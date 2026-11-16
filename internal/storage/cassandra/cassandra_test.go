@@ -58,7 +58,7 @@ func TestCreateGet(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if err := s.Create(ctx, tt.in); err != nil {
+			if err := s.Create(ctx, tt.in, link.CreateOptions{}); err != nil {
 				t.Fatalf("Create: %v", err)
 			}
 			got, err := s.Get(ctx, tt.in.Key)
@@ -105,10 +105,14 @@ func TestErrors(t *testing.T) {
 			deleted := now()
 			return s.Delete(ctx, link.Link{Key: key, CreatedAt: now(), DeletedAt: &deleted})
 		}, wantErr: link.ErrNotFound},
-		{name: "create", run: func() error { return s.Create(ctx, link.Link{Key: key, LongURL: "https://first.example"}) }},
+		{name: "create", run: func() error {
+			return s.Create(ctx, link.Link{Key: key, LongURL: "https://first.example"}, link.CreateOptions{})
+		}},
 		{
-			name:    "duplicate keeps the original",
-			run:     func() error { return s.Create(ctx, link.Link{Key: key, LongURL: "https://second.example"}) },
+			name: "duplicate keeps the original",
+			run: func() error {
+				return s.Create(ctx, link.Link{Key: key, LongURL: "https://second.example"}, link.CreateOptions{})
+			},
 			wantErr: link.ErrKeyTaken,
 			check: func(t *testing.T) {
 				if got, _ := s.Get(ctx, key); got.LongURL != "https://first.example" {
@@ -119,7 +123,7 @@ func TestErrors(t *testing.T) {
 		{
 			name: "invalid user id",
 			run: func() error {
-				return s.Create(ctx, link.Link{Key: uniqueKey(), LongURL: "https://example.com", UserID: "not-a-uuid"})
+				return s.Create(ctx, link.Link{Key: uniqueKey(), LongURL: "https://example.com", UserID: "not-a-uuid"}, link.CreateOptions{})
 			},
 			wantAnyErr: true,
 		},
@@ -161,7 +165,7 @@ func TestCreateConcurrentSameKey(t *testing.T) {
 			var created atomic.Int32
 			for range tt.goroutines {
 				wg.Go(func() {
-					err := s.Create(context.Background(), link.Link{Key: key, LongURL: "https://example.com"})
+					err := s.Create(context.Background(), link.Link{Key: key, LongURL: "https://example.com"}, link.CreateOptions{})
 					switch {
 					case err == nil:
 						created.Add(1)
@@ -196,7 +200,7 @@ func TestUpdateAndDelete(t *testing.T) {
 		wantDeleted bool
 		wantListed  bool
 	}{
-		{name: "create", run: func() error { return s.Create(ctx, created) },
+		{name: "create", run: func() error { return s.Create(ctx, created, link.CreateOptions{}) },
 			wantURL: "https://example.com/old", wantListed: true},
 		{name: "update url in both tables", run: func() error {
 			l := created
@@ -269,7 +273,7 @@ func TestListByUserPagination(t *testing.T) {
 	const total = 7
 	for i := range total {
 		l := link.Link{Key: uniqueKey(), LongURL: "https://example.com", UserID: userID, CreatedAt: base.Add(time.Duration(i) * time.Second)}
-		if err := s.Create(ctx, l); err != nil {
+		if err := s.Create(ctx, l, link.CreateOptions{}); err != nil {
 			t.Fatal(err)
 		}
 	}

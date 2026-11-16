@@ -162,7 +162,7 @@ func TestRedirect(t *testing.T) {
 		{Key: "expired", LongURL: "https://example.com/expired", ExpiresAt: &past},
 		{Key: "deleted", LongURL: "https://example.com/deleted", DeletedAt: &past},
 	} {
-		if err := store.Create(context.Background(), l); err != nil {
+		if err := store.Create(context.Background(), l, link.CreateOptions{}); err != nil {
 			t.Fatal(err)
 		}
 	}
