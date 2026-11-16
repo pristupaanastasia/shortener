@@ -70,6 +70,7 @@ func TestLoadConfig(t *testing.T) {
 		{name: "relative base url", env: map[string]string{"BASE_URL": "/short"}, wantErr: true},
 		{name: "base url without scheme", env: map[string]string{"BASE_URL": "sho.rt"}, wantErr: true},
 		{name: "replication factor not a number", env: map[string]string{"CASSANDRA_REPLICATION_FACTOR": "three"}, wantErr: true},
+		{name: "cassandra without postgres", env: map[string]string{"STORAGE": "cassandra"}, wantErr: true},
 		{name: "rate limit not a number", env: map[string]string{"RATE_LIMIT_ANONYMOUS": "lots"}, wantErr: true},
 		{name: "rate limit zero", env: map[string]string{"RATE_LIMIT_USER": "0"}, wantErr: true},
 		{name: "exact rate limiting", env: map[string]string{"RATE_LIMIT_SYNC_INTERVAL": "0"}, check: func(t *testing.T, cfg config) {

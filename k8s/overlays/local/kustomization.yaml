@@ -1,0 +1,42 @@
+# minikube profile "shortener"; the dependencies run on the host from
+# `make up` and are reached via host.minikube.internal.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+configMapGenerator:
+  - name: shortener-config
+    behavior: merge
+    literals:
+      - CASSANDRA_HOSTS=host.minikube.internal
+      - CASSANDRA_REPLICATION_FACTOR=1
+      - REDIS_ADDR=host.minikube.internal:6379
+      # The external listener: the default one advertises localhost.
+      - KAFKA_BROKERS=host.minikube.internal:9094
+      # The port-forward of scripts/k8s.sh, so returned short_url values work.
+      - BASE_URL=http://127.0.0.1:18080
+      # The smoke test makes many anonymous requests from one IP.
+      - RATE_LIMIT_ANONYMOUS=1000
+secretGenerator:
+  # Development credentials of the docker compose stack.
+  - name: shortener-secrets
+    behavior: merge
+    literals:
+      - POSTGRES_DSN=postgres://shortener:shortener@host.minikube.internal:5432/shortener?sslmode=disable
+      - CLICKHOUSE_DSN=clickhouse://shortener:shortener@host.minikube.internal:9000/shortener
+patches:
+  - target:
+      kind: Deployment
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Never
+  - target:
+      kind: HorizontalPodAutoscaler
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 4

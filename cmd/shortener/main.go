@@ -79,6 +79,11 @@ func loadConfig() (config, error) {
 		return config{}, fmt.Errorf("CASSANDRA_REPLICATION_FACTOR: %w", err)
 	}
 	cfg.cassandra.ReplicationFactor = rf
+	// Shared link storage with per-instance accounts would look healthy but
+	// break: a key registered on one instance would be unknown to the others.
+	if cfg.storage == "cassandra" && cfg.postgresDSN == "" {
+		return config{}, fmt.Errorf("STORAGE=cassandra needs POSTGRES_DSN: in-memory accounts would differ per instance")
+	}
 	for _, limit := range []struct {
 		env string
 		dst *int
