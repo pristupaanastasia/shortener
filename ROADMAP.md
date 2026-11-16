@@ -88,3 +88,15 @@ The first bottleneck in the code found by the M6 load test: two Redis round trip
 - [x] The smoke test can run against an already running service (`SMOKE_URL`), and `make k8s-smoke` runs it through a port-forward
 
 **Done when:** `make k8s-up k8s-deploy k8s-smoke` brings the service up in minikube and the smoke test passes against it, including click statistics; a rolling restart under load loses no requests (`make k8s-rollout`).
+
+## M9: Redis Circuit Breaker
+
+A hung Redis (accepts connections, never answers) costs the 50 ms timeout on every cache, rate-limit and idempotency call. Baseline with a hung Redis, 200 redirects/s over 20 links: p50 0.23 ms, **p99 105 ms** (breaks the 100 ms requirement), 164 warnings in 20 s.
+
+- [x] `internal/breaker`: closed / open / half-open, opens after consecutive failures, one probe after a cooldown; state changes are logged once each
+- [x] Applied as a go-redis hook on every Redis client, so cache, rate limiter and idempotency are all covered; `redis.Nil` and server replies are not failures
+- [x] While open, callers treat Redis as unavailable without waiting and without logging each call
+- [x] Metric `redis_circuit_state`
+- [x] Measure again with the same hung Redis
+
+**Done when:** `make check` and `make coverage` pass; with a hung Redis, redirect p99 is back under 100 ms and warnings drop to the state changes; the breaker closes again when Redis recovers.

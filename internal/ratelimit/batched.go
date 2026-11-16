@@ -2,12 +2,15 @@ package ratelimit
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/pristupaanastasia/shortener/internal/breaker"
 )
 
 // Batched is an approximate fixed-window limiter. Allow decides in memory,
@@ -170,6 +173,12 @@ func (b *Batched) flush(ctx context.Context) {
 		b.mu.Lock()
 		for _, it := range batch {
 			it.c.inflight = 0
+			if errors.Is(it.incr.Err(), breaker.ErrOpen) {
+				// Rejected by the circuit breaker before sending: safe to
+				// send again with the next flush.
+				it.c.pending += it.sent
+				continue
+			}
 			if it.incr.Err() != nil {
 				it.c.unconfirmed += it.sent
 				continue
@@ -177,7 +186,7 @@ func (b *Batched) flush(ctx context.Context) {
 			it.c.global = it.incr.Val()
 		}
 		b.mu.Unlock()
-		if err != nil {
+		if err != nil && !breaker.Quiet(err) { // the breaker logs the outage once
 			b.logger.Warn("rate limit sync failed; counting locally until Redis recovers", "counters", len(batch), "err", err)
 		}
 	}
