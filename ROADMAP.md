@@ -63,8 +63,8 @@ Each milestone produces a working service. Work in order; the user reviews each 
 
 ## M6: Load Testing and Observability
 
-- [ ] Prometheus metrics: request rate, latency histograms, cache hit ratio per level
-- [ ] Load test script (k6 or vegeta) for create and redirect
-- [ ] Report: measured throughput and p99 latency, the first bottleneck found and how it was addressed
+- [x] Prometheus metrics: request rate, latency histograms, cache hit ratio per level
+- [x] Load test script for create and redirect (`make loadtest`: vegeta, natively; k6 in Docker was the first bottleneck)
+- [x] Report: measured throughput and p99 latency, the first bottleneck found and how it was addressed
 
-**Done when:** the load test runs with one command and the report is added to `README.md`.
+**Done when:** the load test runs with one command and the report is added to `README.md` ("Load Test Results").

@@ -638,3 +638,40 @@ Aliases and generated keys share one namespace. A user may pick `hello12`, which
 - Before base62 encoding, the counter passes through a 40-bit Feistel network with secret round keys. Feistel is a bijection for any round function, so keys stay unique while looking random. 2⁴⁰ ≈ 1.1T fits into 7 base62 characters (62⁷ ≈ 3.5T) and covers the 200B links needed.
 
 **Pre-generated keys (KGS)** produce the same result as counter ranges, but require storing billions of keys and tracking used and unused ones in a separate service.
+
+## Load Test Results
+
+Measured with `make loadtest` (vegeta, run natively) and ad-hoc vegeta runs, plus CPU profiles from `/debug/pprof` on the metrics port.
+
+**Test bed:** one MacBook (12 cores), everything on the same machine: the service, the load generator, and single-node Cassandra, Redis, PostgreSQL, Kafka and ClickHouse in Docker Desktop. Absolute numbers are a lower bound for production hardware; the useful results are the ratios and where time goes. Redirects use 1000 links with 80% of traffic on 20% of them (the 80/20 assumption); creates run at the same time.
+
+### Read path (redirects)
+
+| Load generator | Target | Achieved | p50 | p99 | Success | Service CPU |
+|---|---|---|---|---|---|---|
+| k6 in Docker | 10K/s | 10K/s | — | 1.6 ms | 100% | — |
+| k6 in Docker | 30K/s | **23.4K/s** | — | 17 ms | 100% | 1.1 cores |
+| vegeta, native | 10K/s | 10K/s | 52 µs | 0.3 ms | 100% | 0.7 cores |
+| vegeta, native | 30K/s | 30K/s | 53 µs | 1.2 ms | 100% | 1.2 cores |
+| vegeta, native | 50K/s | 49.2K/s | 7.7 ms | 70 ms | 98.5% | 2.2 cores (max 4.4) |
+
+- L1 answered 95–99% of lookups, Redis ~1–3%, Cassandra only the first miss of each link (`cache_lookups_total`).
+- At 30K/s, **our code is under 2% of the service's CPU** (redirect handler 0.6%, metrics middleware 1%); ~95% is socket syscalls and the Go scheduler waking goroutines on network events: the fixed cost of an HTTP request. Publishing clicks to Kafka does not show up in the profile (batched).
+- That is ~23K redirects/s per core. The design load of 100K redirects/s (300K peak) needs about 5 cores (15 at peak) of redirect service, before headroom.
+
+### Write path (creates)
+
+| Target | Achieved | p50 | p99 | Success | Service CPU | Cassandra CPU |
+|---|---|---|---|---|---|---|
+| 1K/s | 1K/s | 3.6 ms | 5.1 ms | 100% | 0.3 cores | — |
+| 3K/s (design peak) | 3K/s | 2.6 ms | 4.9 ms | 100% | 0.8 cores | — |
+| 6K/s | 6K/s | 3.1 ms | 36 ms | 100% | 1.2 cores | 3.1 cores |
+| 10K/s | 10K/s | 4.8 ms | 59 ms | 100% | 1.5 cores | 3.9 cores |
+
+The requirements (redirect p99 < 100 ms, create p99 < 500 ms) are met at every measured load, with a wide margin at the design load.
+
+### Bottlenecks
+
+1. **First bottleneck: the test bed itself.** k6 running in Docker Desktop capped at ~23.4K requests/s and added ~15 ms to p99 through the virtual network, while the service used ~1.1 of 12 cores. The same service with a native generator served 30K/s with p99 1.2 ms. **Addressed:** `make loadtest` now runs vegeta natively and checks the latency requirements itself. At ~50K/s the native generator runs out of ephemeral ports on the client side (`bind: can't assign requested address`), so higher read loads need a load generator on separate machines.
+2. **First bottleneck in the code: Redis round trips on the write path.** At 10K creates/s, the rate limiter's `INCR`+`EXPIRE` transaction takes 15% of the service's CPU and the negative-cache `DEL` on create ~9.5%, against 4% for the Cassandra LWT itself. Not addressed yet, because it only matters at over 3× the design write peak. When it does: count rate limits locally and flush increments to Redis in batches (an approximate limit, trading accuracy for one round trip per batch instead of per request), and skip the negative-cache `DEL` for generated keys (a random key is practically never looked up before it exists; only aliases need it).
+3. **Next infrastructure limit: the single Cassandra node** at ~3.9 cores for 10K creates/s (Paxos for every LWT). In production, writes spread over a multi-node cluster.
