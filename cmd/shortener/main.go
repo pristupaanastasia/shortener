@@ -30,6 +30,7 @@ import (
 	"github.com/pristupaanastasia/shortener/internal/storage/postgres"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/redis/go-redis/v9"
 )
 
 type config struct {
@@ -195,12 +196,18 @@ func run(logger *slog.Logger) error {
 			logger.Warn("redis unavailable, serving from storage until it recovers", "err", err)
 		}
 		store = cached
+		// The limiter's client must not retry: re-sending an increment that
+		// Redis already applied would count requests twice.
+		limiterOpts := cache.RedisOptions(cfg.redisAddr)
+		limiterOpts.MaxRetries = -1
+		limiterRDB := redis.NewClient(limiterOpts)
+		defer limiterRDB.Close()
 		if cfg.rateLimitSync > 0 {
-			limiter := ratelimit.NewBatched(rdb, cfg.rateLimitSync, logger)
+			limiter := ratelimit.NewBatched(limiterRDB, cfg.rateLimitSync, logger)
 			defer limiter.Close() // after the server has stopped: flushes the last counts
 			api.Limiter = limiter
 		} else {
-			api.Limiter = ratelimit.New(rdb)
+			api.Limiter = ratelimit.New(limiterRDB)
 		}
 		api.Idempotency = idempotency.New(rdb, idempotency.DefaultTTL)
 	} else {

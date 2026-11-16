@@ -59,7 +59,13 @@ func DefaultConfig() Config {
 // timeouts and a single fast retry, so an unavailable Redis costs
 // milliseconds per request instead of seconds (the library defaults).
 func NewRedisClient(addr string) *redis.Client {
-	return redis.NewClient(&redis.Options{
+	return redis.NewClient(RedisOptions(addr))
+}
+
+// RedisOptions returns the options NewRedisClient uses, for clients that
+// need to change one of them.
+func RedisOptions(addr string) *redis.Options {
+	return &redis.Options{
 		Addr:            addr,
 		DialTimeout:     200 * time.Millisecond,
 		ReadTimeout:     50 * time.Millisecond,
@@ -71,7 +77,7 @@ func NewRedisClient(addr string) *redis.Client {
 		// and the two multiply.
 		DialerRetries:      1,
 		DialerRetryTimeout: 5 * time.Millisecond,
-	})
+	}
 }
 
 // Store wraps a link.Store with L1 and Redis caches. It implements link.Store.

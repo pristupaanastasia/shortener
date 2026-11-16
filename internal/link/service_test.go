@@ -457,3 +457,38 @@ func TestUpdateWithStaleRead(t *testing.T) {
 		})
 	}
 }
+
+// optsStore records the CreateOptions of the last Create.
+type optsStore struct {
+	mapStore
+	last CreateOptions
+}
+
+func (s *optsStore) Create(ctx context.Context, l Link, opts CreateOptions) error {
+	s.last = opts
+	return s.mapStore.Create(ctx, l, opts)
+}
+
+// A cache skips dropping a negative entry for generated keys only; an alias
+// marked as generated would keep serving 404 after it is created.
+func TestCreatePassesGeneratedKey(t *testing.T) {
+	tests := []struct {
+		name          string
+		params        CreateParams
+		wantGenerated bool
+	}{
+		{name: "alias", params: CreateParams{LongURL: "https://example.com", Alias: "sale2026"}, wantGenerated: false},
+		{name: "generated key", params: CreateParams{LongURL: "https://example.com"}, wantGenerated: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &optsStore{mapStore: mapStore{}}
+			if _, err := newTestService(store).Create(context.Background(), tt.params); err != nil {
+				t.Fatal(err)
+			}
+			if store.last.GeneratedKey != tt.wantGenerated {
+				t.Errorf("GeneratedKey = %v, want %v", store.last.GeneratedKey, tt.wantGenerated)
+			}
+		})
+	}
+}
