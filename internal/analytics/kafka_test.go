@@ -56,11 +56,19 @@ func (s *memorySink) count(key string) int {
 	return n
 }
 
-// consume runs a consumer in group until stop is called; stop returns Run's
-// error.
-func consume(t *testing.T, group string, sink Sink) (stop func() error) {
+// newTopic returns a name for a topic of its own: tests must not depend on
+// the history of the shared topic, which may hold millions of events (e.g.
+// after a load test) that a new consumer group would read from the start.
+// The topic is created on first use.
+func newTopic() string {
+	return "it-" + strings.ToLower(rand.Text())[:12]
+}
+
+// consume runs a consumer of topic in group until stop is called; stop
+// returns Run's error.
+func consume(t *testing.T, topic, group string, sink Sink) (stop func() error) {
 	t.Helper()
-	c, err := NewConsumer(ConsumerConfig{Brokers: brokers(), Group: group, BatchSize: 100, FlushInterval: 200 * time.Millisecond},
+	c, err := NewConsumer(ConsumerConfig{Brokers: brokers(), Topic: topic, Group: group, BatchSize: 100, FlushInterval: 200 * time.Millisecond},
 		sink, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
@@ -80,9 +88,9 @@ func consume(t *testing.T, group string, sink Sink) (stop func() error) {
 	}
 }
 
-func publish(t *testing.T, key string, n int) {
+func publish(t *testing.T, topic, key string, n int) {
 	t.Helper()
-	pub, err := NewKafkaPublisher(brokers(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	pub, err := NewKafkaPublisher(brokers(), slog.New(slog.NewTextHandler(io.Discard, nil)), WithTopic(topic))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,11 +116,11 @@ func TestStopDuringRetryKeepsEvents(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			key := "it" + strings.ToLower(rand.Text())[:10]
-			group := "it-" + key
-			publish(t, key, tt.events)
+			topic, group := newTopic(), "it-"+key
+			publish(t, topic, key, tt.events)
 
 			down := &memorySink{failures: 1 << 30} // ClickHouse is down
-			stop := consume(t, group, down)
+			stop := consume(t, topic, group, down)
 			waitFor(t, "the consumer to start retrying", func() bool {
 				down.mu.Lock()
 				defer down.mu.Unlock()
@@ -123,7 +131,7 @@ func TestStopDuringRetryKeepsEvents(t *testing.T) {
 			}
 
 			up := &memorySink{}
-			stop = consume(t, group, up)
+			stop = consume(t, topic, group, up)
 			waitFor(t, "events after restart", func() bool { return up.count(key) >= tt.events })
 			if err := stop(); err != nil {
 				t.Errorf("Run: %v", err)
@@ -158,14 +166,13 @@ func TestKafkaPipeline(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel() // each case has its own key and consumer group
-			// A unique link key and group per run: the topic keeps old events.
+			t.Parallel() // each case has its own topic, key and consumer group
 			key := "it" + strings.ToLower(rand.Text())[:10]
-			group := "it-" + key
+			topic, group := newTopic(), "it-"+key
 
-			publish(t, key, tt.events)
+			publish(t, topic, key, tt.events)
 			// A malformed record must be skipped, not block the partition.
-			raw, err := kgo.NewClient(kgo.SeedBrokers(brokers()...), kgo.DefaultProduceTopic(Topic))
+			raw, err := kgo.NewClient(kgo.SeedBrokers(brokers()...), kgo.DefaultProduceTopic(topic))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -175,7 +182,7 @@ func TestKafkaPipeline(t *testing.T) {
 			raw.Close()
 
 			sink := &memorySink{failures: tt.sinkFailures}
-			stop := consume(t, group, sink)
+			stop := consume(t, topic, group, sink)
 			waitFor(t, "all events in the sink", func() bool { return sink.count(key) >= tt.events })
 			if err := stop(); err != nil {
 				t.Errorf("Run: %v", err)
@@ -183,8 +190,7 @@ func TestKafkaPipeline(t *testing.T) {
 			if got := sink.count(key); got != tt.events {
 				t.Errorf("sink has %d events, want %d", got, tt.events)
 			}
-			// The new group reads the topic from the start, including events of
-			// other runs: check a row of this run.
+			// Only this run's events are in the topic.
 			for _, row := range sink.rows {
 				if row.Key == key && (row.Country != "DE" || row.Device != "bot" || row.Referrer != "direct") {
 					t.Errorf("row = %+v, want enriched DE/bot/direct", row)
@@ -194,7 +200,7 @@ func TestKafkaPipeline(t *testing.T) {
 
 			// Offsets were committed: the same group does not see them again.
 			again := &memorySink{}
-			stop = consume(t, group, again)
+			stop = consume(t, topic, group, again)
 			time.Sleep(3 * time.Second)
 			if err := stop(); err != nil {
 				t.Errorf("Run: %v", err)

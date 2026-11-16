@@ -14,6 +14,9 @@ log="$work/server.log"
 analytics=false
 if [ -n "${KAFKA_BROKERS:-}" ] && [ -n "${CLICKHOUSE_DSN:-}" ]; then
 	analytics=true
+	# A topic of its own: the shared one may hold millions of events (e.g.
+	# after a load test), and concurrent runs must not see each other's clicks.
+	export KAFKA_TOPIC="smoke-$(date +%s)$RANDOM"
 fi
 
 # With SMOKE_COVERDIR set, binaries are built with coverage instrumentation
@@ -34,10 +37,6 @@ pid=$!
 consumer_pid=""
 if $analytics; then
 	"${build[@]}" -o "$work/consumer" ./cmd/consumer
-	# One fixed group for all smoke runs: its committed offsets mean each run
-	# processes only new events (a fresh group would re-insert the whole topic
-	# into ClickHouse every time), and concurrent runs share the partitions,
-	# so every event is inserted once.
 	KAFKA_GROUP=smoke FLUSH_INTERVAL=200ms "$work/consumer" >"$work/consumer.log" 2>&1 &
 	consumer_pid=$!
 fi

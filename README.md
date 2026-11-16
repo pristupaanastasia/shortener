@@ -530,7 +530,7 @@ This is the **cache-aside** pattern: the application reads the cache, falls back
 
 ### Flow 4: Analytics
 
-1. The Redirect Service publishes `{key, timestamp, country, user_agent, referrer_host}` to the Kafka topic `clicks`, **keyed by `key`** (all clicks of a link go to the same partition). Publishing never blocks: events are buffered in memory (up to 100K events or 64 MB) and sent in batches; when the buffer is full, new events are dropped and counted. Events stay small: only the referrer's host is sent (paths and queries may contain personal data) and the User-Agent is cut to 512 bytes.
+1. The Redirect Service publishes `{key, timestamp, country, user_agent, referrer_host}` to the Kafka topic `clicks` (`KAFKA_TOPIC`; tests, the smoke test and the load test use a topic of their own per run, so they never depend on the shared topic's history), **keyed by `key`** (all clicks of a link go to the same partition). Publishing never blocks: events are buffered in memory (up to 100K events or 64 MB) and sent in batches; when the buffer is full, new events are dropped and counted. Events stay small: only the referrer's host is sent (paths and queries may contain personal data) and the User-Agent is cut to 512 bytes.
    - **No IP address enters the pipeline.** The country comes from a header set by the CDN or load balancer (e.g. Cloudflare's `CF-IPCountry`, configured with `COUNTRY_HEADER`). This avoids storing personal data (GDPR) and needs no GeoIP database. The header is read only when configured, since clients could send it themselves.
 2. **Analytics Consumers** (`cmd/consumer`, scaled independently) read in batches:
    - User-Agent → device type (desktop, mobile, tablet, bot);

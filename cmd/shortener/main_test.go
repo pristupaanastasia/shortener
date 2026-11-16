@@ -19,6 +19,9 @@ func TestLoadConfig(t *testing.T) {
 			if cfg.cassandra.Keyspace != "shortener" || cfg.cassandra.ReplicationFactor != 1 || len(cfg.cassandra.Hosts) != 1 {
 				t.Errorf("cassandra = %+v", cfg.cassandra)
 			}
+			if cfg.kafkaTopic != "clicks" {
+				t.Errorf("kafkaTopic = %q, want clicks", cfg.kafkaTopic)
+			}
 			if cfg.redisAddr != "" || cfg.postgresDSN != "" || cfg.kafkaBrokers != nil || cfg.clickhouseDSN != "" || cfg.countryHeader != "" {
 				t.Errorf("optional dependencies enabled by default: %+v", cfg)
 			}
@@ -29,7 +32,7 @@ func TestLoadConfig(t *testing.T) {
 				"ADDR": ":9000", "BASE_URL": "https://sho.rt", "STORAGE": "cassandra",
 				"CASSANDRA_HOSTS": "c1,c2,c3", "CASSANDRA_KEYSPACE": "links", "CASSANDRA_REPLICATION_FACTOR": "3",
 				"REDIS_ADDR": "redis:6379", "POSTGRES_DSN": "postgres://db",
-				"KAFKA_BROKERS": "k1:9092,k2:9092", "CLICKHOUSE_DSN": "clickhouse://ch", "COUNTRY_HEADER": "CF-IPCountry",
+				"KAFKA_BROKERS": "k1:9092,k2:9092", "KAFKA_TOPIC": "events", "CLICKHOUSE_DSN": "clickhouse://ch", "COUNTRY_HEADER": "CF-IPCountry",
 				"RATE_LIMIT_ANONYMOUS": "50", "RATE_LIMIT_USER": "500",
 			},
 			check: func(t *testing.T, cfg config) {
@@ -39,7 +42,7 @@ func TestLoadConfig(t *testing.T) {
 				if len(cfg.cassandra.Hosts) != 3 || cfg.cassandra.Keyspace != "links" || cfg.cassandra.ReplicationFactor != 3 {
 					t.Errorf("cassandra = %+v", cfg.cassandra)
 				}
-				if len(cfg.kafkaBrokers) != 2 || cfg.clickhouseDSN != "clickhouse://ch" || cfg.countryHeader != "CF-IPCountry" {
+				if len(cfg.kafkaBrokers) != 2 || cfg.kafkaTopic != "events" || cfg.clickhouseDSN != "clickhouse://ch" || cfg.countryHeader != "CF-IPCountry" {
 					t.Errorf("analytics = %v %q %q", cfg.kafkaBrokers, cfg.clickhouseDSN, cfg.countryHeader)
 				}
 				if cfg.anonymousLimit != 50 || cfg.userLimit != 500 {
@@ -55,7 +58,7 @@ func TestLoadConfig(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			for _, k := range []string{"ADDR", "METRICS_ADDR", "BASE_URL", "STORAGE", "CASSANDRA_HOSTS", "CASSANDRA_KEYSPACE", "CASSANDRA_REPLICATION_FACTOR", "REDIS_ADDR", "POSTGRES_DSN", "KAFKA_BROKERS", "CLICKHOUSE_DSN", "COUNTRY_HEADER", "RATE_LIMIT_ANONYMOUS", "RATE_LIMIT_USER"} {
+			for _, k := range []string{"ADDR", "METRICS_ADDR", "BASE_URL", "STORAGE", "CASSANDRA_HOSTS", "CASSANDRA_KEYSPACE", "CASSANDRA_REPLICATION_FACTOR", "REDIS_ADDR", "POSTGRES_DSN", "KAFKA_BROKERS", "KAFKA_TOPIC", "CLICKHOUSE_DSN", "COUNTRY_HEADER", "RATE_LIMIT_ANONYMOUS", "RATE_LIMIT_USER"} {
 				t.Setenv(k, tt.env[k])
 			}
 			cfg, err := loadConfig()

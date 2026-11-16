@@ -46,8 +46,9 @@ type config struct {
 	userLimit      int
 
 	kafkaBrokers  []string // empty: clicks are not published
-	clickhouseDSN string   // empty: no statistics endpoint
-	countryHeader string   // header with the client's country, set by the edge
+	kafkaTopic    string
+	clickhouseDSN string // empty: no statistics endpoint
+	countryHeader string // header with the client's country, set by the edge
 }
 
 func loadConfig() (config, error) {
@@ -89,6 +90,7 @@ func loadConfig() (config, error) {
 			*limit.dst = n
 		}
 	}
+	cfg.kafkaTopic = getenv("KAFKA_TOPIC", analytics.Topic)
 	if brokers := os.Getenv("KAFKA_BROKERS"); brokers != "" {
 		cfg.kafkaBrokers = strings.Split(brokers, ",")
 	}
@@ -183,7 +185,7 @@ func run(logger *slog.Logger) error {
 	api.Accounts = account.NewService(accounts)
 
 	if len(cfg.kafkaBrokers) > 0 {
-		publisher, err := analytics.NewKafkaPublisher(cfg.kafkaBrokers, logger)
+		publisher, err := analytics.NewKafkaPublisher(cfg.kafkaBrokers, logger, analytics.WithTopic(cfg.kafkaTopic))
 		if err != nil {
 			return err
 		}

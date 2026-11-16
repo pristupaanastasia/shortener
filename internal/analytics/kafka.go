@@ -11,9 +11,22 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-// Topic is the Kafka topic for click events. Records are keyed by link key,
-// so all clicks of a link go to the same partition.
+// Topic is the default Kafka topic for click events. Records are keyed by
+// link key, so all clicks of a link go to the same partition.
 const Topic = "clicks"
+
+// PublisherOption configures a KafkaPublisher.
+type PublisherOption func(*publisherConfig)
+
+type publisherConfig struct {
+	topic string
+}
+
+// WithTopic publishes to topic instead of Topic (e.g. an isolated topic per
+// test, which does not depend on the history of the shared one).
+func WithTopic(topic string) PublisherOption {
+	return func(c *publisherConfig) { c.topic = topic }
+}
 
 // KafkaPublisher publishes clicks to Kafka asynchronously.
 type KafkaPublisher struct {
@@ -26,10 +39,14 @@ type KafkaPublisher struct {
 
 // NewKafkaPublisher returns a publisher for brokers. It does not wait for
 // Kafka to be reachable: the redirect service must start without it.
-func NewKafkaPublisher(brokers []string, logger *slog.Logger) (*KafkaPublisher, error) {
+func NewKafkaPublisher(brokers []string, logger *slog.Logger, opts ...PublisherOption) (*KafkaPublisher, error) {
+	cfg := publisherConfig{topic: Topic}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(brokers...),
-		kgo.DefaultProduceTopic(Topic),
+		kgo.DefaultProduceTopic(cfg.topic),
 		kgo.AllowAutoTopicCreation(),
 		// Records wait in memory and are sent in batches.
 		kgo.ProducerLinger(50*time.Millisecond),

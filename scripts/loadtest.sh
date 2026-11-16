@@ -25,10 +25,12 @@ work="$(mktemp -d)"
 "${vegeta[@]}" -version >/dev/null # download and build once, before timing anything
 go build -o "$work/shortener" ./cmd/shortener
 
-# Rate limits are raised: the load generator is a single client.
+# Rate limits are raised: the load generator is a single client. Clicks go to
+# a topic of their own, so a million load-test events do not pile up in the
+# shared topic that consumers and tests read.
 STORAGE=cassandra REDIS_ADDR=127.0.0.1:6379 \
 POSTGRES_DSN="postgres://shortener:shortener@127.0.0.1:5432/shortener?sslmode=disable" \
-KAFKA_BROKERS=127.0.0.1:9092 \
+KAFKA_BROKERS=127.0.0.1:9092 KAFKA_TOPIC="loadtest-$(date +%s)" \
 RATE_LIMIT_ANONYMOUS=100000000 RATE_LIMIT_USER=100000000 \
 ADDR=":$port" METRICS_ADDR=":$metrics_port" BASE_URL="$base" \
 	"$work/shortener" >"$work/server.log" 2>&1 &
