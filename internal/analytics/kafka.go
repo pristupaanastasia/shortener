@@ -11,23 +11,42 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-// Topic is the Kafka topic for click events. Records are keyed by link key,
-// so all clicks of a link go to the same partition.
+// Topic is the default Kafka topic for click events. Records are keyed by
+// link key, so all clicks of a link go to the same partition.
 const Topic = "clicks"
+
+// PublisherOption configures a KafkaPublisher.
+type PublisherOption func(*publisherConfig)
+
+type publisherConfig struct {
+	topic string
+}
+
+// WithTopic publishes to topic instead of Topic (e.g. an isolated topic per
+// test, which does not depend on the history of the shared one).
+func WithTopic(topic string) PublisherOption {
+	return func(c *publisherConfig) { c.topic = topic }
+}
 
 // KafkaPublisher publishes clicks to Kafka asynchronously.
 type KafkaPublisher struct {
 	client  *kgo.Client
 	logger  *slog.Logger
 	dropped atomic.Int64
+	// closeTimeout bounds how long Close waits for buffered events.
+	closeTimeout time.Duration
 }
 
 // NewKafkaPublisher returns a publisher for brokers. It does not wait for
 // Kafka to be reachable: the redirect service must start without it.
-func NewKafkaPublisher(brokers []string, logger *slog.Logger) (*KafkaPublisher, error) {
+func NewKafkaPublisher(brokers []string, logger *slog.Logger, opts ...PublisherOption) (*KafkaPublisher, error) {
+	cfg := publisherConfig{topic: Topic}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(brokers...),
-		kgo.DefaultProduceTopic(Topic),
+		kgo.DefaultProduceTopic(cfg.topic),
 		kgo.AllowAutoTopicCreation(),
 		// Records wait in memory and are sent in batches.
 		kgo.ProducerLinger(50*time.Millisecond),
@@ -41,7 +60,7 @@ func NewKafkaPublisher(brokers []string, logger *slog.Logger) (*KafkaPublisher, 
 	if err != nil {
 		return nil, fmt.Errorf("kafka client: %w", err)
 	}
-	return &KafkaPublisher{client: client, logger: logger}, nil
+	return &KafkaPublisher{client: client, logger: logger, closeTimeout: 5 * time.Second}, nil
 }
 
 // Publish implements Publisher. TryProduce returns immediately; delivery
@@ -70,10 +89,10 @@ func (p *KafkaPublisher) drop(err error) {
 // Dropped returns the number of events lost so far.
 func (p *KafkaPublisher) Dropped() int64 { return p.dropped.Load() }
 
-// Close sends buffered events (waiting at most a few seconds) and closes the
+// Close sends buffered events (waiting at most closeTimeout) and closes the
 // client.
 func (p *KafkaPublisher) Close() {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), p.closeTimeout)
 	defer cancel()
 	_ = p.client.Flush(ctx)
 	p.client.Close()

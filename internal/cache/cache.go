@@ -34,6 +34,10 @@ type Config struct {
 	// StoreTimeout bounds a store read on a miss. The read is shared by all
 	// waiting callers, so it does not use any single caller's context.
 	StoreTimeout time.Duration
+
+	// OnLookup, if set, is called for every Get with the level that answered:
+	// "l1", "redis" or "store" (e.g. to count hit ratios per level).
+	OnLookup func(level string)
 }
 
 // DefaultConfig returns the values from README.md.
@@ -143,12 +147,15 @@ func (s *Store) Create(ctx context.Context, l link.Link) error {
 // store round-trip.
 func (s *Store) Get(ctx context.Context, key string) (link.Link, error) {
 	if e, ok := s.l1.Get(key); ok {
+		s.lookup("l1")
 		return e.link(key)
 	}
 	if e, ok := s.getRedis(ctx, key); ok {
+		s.lookup("redis")
 		s.l1.Add(key, e)
 		return e.link(key)
 	}
+	s.lookup("store")
 
 	// Concurrent misses for one key share a single store read.
 	v, err, _ := s.group.Do(key, func() (any, error) {
@@ -197,6 +204,12 @@ func (s *Store) Delete(ctx context.Context, l link.Link) error {
 // change on every create, update and delete.
 func (s *Store) ListByUser(ctx context.Context, userID, cursor string, limit int) ([]link.Link, string, error) {
 	return s.next.ListByUser(ctx, userID, cursor, limit)
+}
+
+func (s *Store) lookup(level string) {
+	if s.cfg.OnLookup != nil {
+		s.cfg.OnLookup(level)
+	}
 }
 
 // Invalidate removes key from both cache levels, then again after

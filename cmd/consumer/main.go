@@ -19,6 +19,7 @@ import (
 
 type config struct {
 	brokers       []string
+	topic         string
 	group         string
 	clickhouseDSN string
 	batchSize     int
@@ -28,6 +29,7 @@ type config struct {
 func loadConfig() (config, error) {
 	cfg := config{
 		brokers:       strings.Split(getenv("KAFKA_BROKERS", "127.0.0.1:9092"), ","),
+		topic:         getenv("KAFKA_TOPIC", analytics.Topic),
 		group:         getenv("KAFKA_GROUP", "analytics"),
 		clickhouseDSN: getenv("CLICKHOUSE_DSN", "clickhouse://shortener:shortener@127.0.0.1:9000/shortener"),
 	}
@@ -72,6 +74,7 @@ func run(logger *slog.Logger) error {
 
 	consumer, err := analytics.NewConsumer(analytics.ConsumerConfig{
 		Brokers:       cfg.brokers,
+		Topic:         cfg.topic,
 		Group:         cfg.group,
 		BatchSize:     cfg.batchSize,
 		FlushInterval: cfg.flushInterval,
@@ -79,7 +82,7 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	logger.Info("consuming", "brokers", cfg.brokers, "group", cfg.group, "batch_size", cfg.batchSize, "flush_interval", cfg.flushInterval.String())
+	logger.Info("consuming", "brokers", cfg.brokers, "topic", cfg.topic, "group", cfg.group, "batch_size", cfg.batchSize, "flush_interval", cfg.flushInterval.String())
 	if err := consumer.Run(ctx); err != nil {
 		return err
 	}

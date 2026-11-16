@@ -14,6 +14,9 @@ log="$work/server.log"
 analytics=false
 if [ -n "${KAFKA_BROKERS:-}" ] && [ -n "${CLICKHOUSE_DSN:-}" ]; then
 	analytics=true
+	# A topic of its own: the shared one may hold millions of events (e.g.
+	# after a load test), and concurrent runs must not see each other's clicks.
+	export KAFKA_TOPIC="smoke-$(date +%s)$RANDOM"
 fi
 
 # With SMOKE_COVERDIR set, binaries are built with coverage instrumentation
@@ -28,15 +31,12 @@ fi
 "${build[@]}" -o "$work/shortener" ./cmd/shortener
 # Several smoke runs per minute from 127.0.0.1 (the pre-push hook, CI,
 # concurrent runs) would exceed the default anonymous limit of 10/min.
-RATE_LIMIT_ANONYMOUS=1000 ADDR=":$port" BASE_URL="$base" "$work/shortener" >"$log" 2>&1 &
+metrics_port="${SMOKE_METRICS_PORT:-$((port + 1))}"
+RATE_LIMIT_ANONYMOUS=1000 METRICS_ADDR=":$metrics_port" ADDR=":$port" BASE_URL="$base" "$work/shortener" >"$log" 2>&1 &
 pid=$!
 consumer_pid=""
 if $analytics; then
 	"${build[@]}" -o "$work/consumer" ./cmd/consumer
-	# One fixed group for all smoke runs: its committed offsets mean each run
-	# processes only new events (a fresh group would re-insert the whole topic
-	# into ClickHouse every time), and concurrent runs share the partitions,
-	# so every event is inserted once.
 	KAFKA_GROUP=smoke FLUSH_INTERVAL=200ms "$work/consumer" >"$work/consumer.log" 2>&1 &
 	consumer_pid=$!
 fi
@@ -103,6 +103,8 @@ expect "list without key" 401 "$(status "$base/api/v1/links")"
 expect "delete link" 204 "$(status -X DELETE "$base/api/v1/links/$alias" "${auth[@]}")"
 expect "redirect after delete" 410 "$(status "$base/$alias")"
 expect "unknown key" 404 "$(status "$base/nosuchkey$run")"
+redirects="$(curl -s "http://127.0.0.1:$metrics_port/metrics" | grep -c '^http_requests_total{code="301",method="GET",route="GET /{key}"}' || true)"
+expect "metrics count redirects by route pattern" 1 "$redirects"
 
 kill -INT "$pid"
 code=0

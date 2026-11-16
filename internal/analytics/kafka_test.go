@@ -56,11 +56,37 @@ func (s *memorySink) count(key string) int {
 	return n
 }
 
-// consume runs a consumer in group until stop is called; stop returns Run's
-// error.
-func consume(t *testing.T, group string, sink Sink) (stop func() error) {
+// newTopic creates a topic of its own for a test and waits until it accepts
+// writes. Tests must not depend on the history of the shared topic, which may
+// hold millions of events (e.g. after a load test) that a new consumer group
+// would read from the start.
+//
+// Creation is explicit: if the publisher under test created the topic on its
+// first write, leader election under a loaded machine could outlast its
+// 5-second close timeout and drop events. The record written here is not
+// valid JSON, so every consumer test also checks that a malformed event is
+// skipped instead of blocking the partition.
+func newTopic(t *testing.T) string {
 	t.Helper()
-	c, err := NewConsumer(ConsumerConfig{Brokers: brokers(), Group: group, BatchSize: 100, FlushInterval: 200 * time.Millisecond},
+	topic := "it-" + strings.ToLower(rand.Text())[:12]
+	client, err := kgo.NewClient(kgo.SeedBrokers(brokers()...), kgo.DefaultProduceTopic(topic), kgo.AllowAutoTopicCreation())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := client.ProduceSync(ctx, &kgo.Record{Key: []byte("malformed"), Value: []byte("not json")}).FirstErr(); err != nil {
+		t.Fatalf("create topic %s: %v", topic, err)
+	}
+	return topic
+}
+
+// consume runs a consumer of topic in group until stop is called; stop
+// returns Run's error.
+func consume(t *testing.T, topic, group string, sink Sink) (stop func() error) {
+	t.Helper()
+	c, err := NewConsumer(ConsumerConfig{Brokers: brokers(), Topic: topic, Group: group, BatchSize: 100, FlushInterval: 200 * time.Millisecond},
 		sink, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
@@ -80,9 +106,9 @@ func consume(t *testing.T, group string, sink Sink) (stop func() error) {
 	}
 }
 
-func publish(t *testing.T, key string, n int) {
+func publish(t *testing.T, topic, key string, n int) {
 	t.Helper()
-	pub, err := NewKafkaPublisher(brokers(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	pub, err := NewKafkaPublisher(brokers(), slog.New(slog.NewTextHandler(io.Discard, nil)), WithTopic(topic))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,6 +124,7 @@ func publish(t *testing.T, key string, n int) {
 // Regression: stopping while an insert was being retried committed the
 // offsets of the batch that was never stored, losing it.
 func TestStopDuringRetryKeepsEvents(t *testing.T) {
+	t.Parallel() // its own key and consumer group
 	tests := []struct {
 		name   string
 		events int
@@ -107,11 +134,11 @@ func TestStopDuringRetryKeepsEvents(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			key := "it" + strings.ToLower(rand.Text())[:10]
-			group := "it-" + key
-			publish(t, key, tt.events)
+			topic, group := newTopic(t), "it-"+key
+			publish(t, topic, key, tt.events)
 
 			down := &memorySink{failures: 1 << 30} // ClickHouse is down
-			stop := consume(t, group, down)
+			stop := consume(t, topic, group, down)
 			waitFor(t, "the consumer to start retrying", func() bool {
 				down.mu.Lock()
 				defer down.mu.Unlock()
@@ -122,7 +149,7 @@ func TestStopDuringRetryKeepsEvents(t *testing.T) {
 			}
 
 			up := &memorySink{}
-			stop = consume(t, group, up)
+			stop = consume(t, topic, group, up)
 			waitFor(t, "events after restart", func() bool { return up.count(key) >= tt.events })
 			if err := stop(); err != nil {
 				t.Errorf("Run: %v", err)
@@ -146,6 +173,7 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 }
 
 func TestKafkaPipeline(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name         string
 		events       int
@@ -156,23 +184,14 @@ func TestKafkaPipeline(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// A unique link key and group per run: the topic keeps old events.
+			t.Parallel() // each case has its own topic, key and consumer group
 			key := "it" + strings.ToLower(rand.Text())[:10]
-			group := "it-" + key
+			topic, group := newTopic(t), "it-"+key
 
-			publish(t, key, tt.events)
-			// A malformed record must be skipped, not block the partition.
-			raw, err := kgo.NewClient(kgo.SeedBrokers(brokers()...), kgo.DefaultProduceTopic(Topic))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := raw.ProduceSync(context.Background(), &kgo.Record{Key: []byte(key), Value: []byte("not json")}).FirstErr(); err != nil {
-				t.Fatal(err)
-			}
-			raw.Close()
+			publish(t, topic, key, tt.events) // after newTopic's malformed record
 
 			sink := &memorySink{failures: tt.sinkFailures}
-			stop := consume(t, group, sink)
+			stop := consume(t, topic, group, sink)
 			waitFor(t, "all events in the sink", func() bool { return sink.count(key) >= tt.events })
 			if err := stop(); err != nil {
 				t.Errorf("Run: %v", err)
@@ -180,8 +199,7 @@ func TestKafkaPipeline(t *testing.T) {
 			if got := sink.count(key); got != tt.events {
 				t.Errorf("sink has %d events, want %d", got, tt.events)
 			}
-			// The new group reads the topic from the start, including events of
-			// other runs: check a row of this run.
+			// Only this run's events are in the topic.
 			for _, row := range sink.rows {
 				if row.Key == key && (row.Country != "DE" || row.Device != "bot" || row.Referrer != "direct") {
 					t.Errorf("row = %+v, want enriched DE/bot/direct", row)
@@ -191,7 +209,7 @@ func TestKafkaPipeline(t *testing.T) {
 
 			// Offsets were committed: the same group does not see them again.
 			again := &memorySink{}
-			stop = consume(t, group, again)
+			stop = consume(t, topic, group, again)
 			time.Sleep(3 * time.Second)
 			if err := stop(); err != nil {
 				t.Errorf("Run: %v", err)

@@ -1,6 +1,7 @@
 package analytics
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -18,6 +19,7 @@ type Sink interface {
 // ConsumerConfig tunes batching.
 type ConsumerConfig struct {
 	Brokers       []string
+	Topic         string // default: Topic
 	Group         string
 	BatchSize     int           // insert when this many rows are buffered...
 	FlushInterval time.Duration // ...or when this much time has passed
@@ -40,7 +42,7 @@ func NewConsumer(cfg ConsumerConfig, sink Sink, logger *slog.Logger) (*Consumer,
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(cfg.Brokers...),
 		kgo.ConsumerGroup(cfg.Group),
-		kgo.ConsumeTopics(Topic),
+		kgo.ConsumeTopics(cmp.Or(cfg.Topic, Topic)),
 		kgo.AllowAutoTopicCreation(),
 		kgo.DisableAutoCommit(),
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),

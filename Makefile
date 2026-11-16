@@ -1,4 +1,4 @@
-.PHONY: build run test test-integration coverage smoke smoke-full lint check up down hooks
+.PHONY: build run test test-integration coverage smoke smoke-full loadtest lint check up down hooks
 
 build:
 	go build -o bin/shortener ./cmd/shortener
@@ -30,6 +30,11 @@ smoke-full:
 	KAFKA_BROKERS=127.0.0.1:9092 \
 	CLICKHOUSE_DSN="clickhouse://shortener:shortener@127.0.0.1:9000/shortener" \
 	./scripts/smoke.sh
+
+# Load test against the `make up` stack; fails if the latency requirements
+# are not met. Tune with REDIRECT_RATE, CREATE_RATE, DURATION, LINKS.
+loadtest:
+	./scripts/loadtest.sh
 
 # gofmt -l prints unformatted files; fail if there are any.
 lint:
