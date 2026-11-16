@@ -35,9 +35,11 @@ type Config struct {
 	// waiting callers, so it does not use any single caller's context.
 	StoreTimeout time.Duration
 
-	// OnLookup, if set, is called for every Get with the level that answered:
-	// "l1", "redis" or "store" (e.g. to count hit ratios per level).
-	OnLookup func(level string)
+	// OnLookup, if set, is called once for every Get with its outcome: "l1"
+	// or "redis" (cache hits), "store" (this call read the store; concurrent
+	// misses share one read), "coalesced" (this call waited for another
+	// call's store read) or "store_error" (the read failed).
+	OnLookup func(outcome string)
 }
 
 // DefaultConfig returns the values from README.md.
@@ -155,10 +157,10 @@ func (s *Store) Get(ctx context.Context, key string) (link.Link, error) {
 		s.l1.Add(key, e)
 		return e.link(key)
 	}
-	s.lookup("store")
-
 	// Concurrent misses for one key share a single store read.
+	ran := false
 	v, err, _ := s.group.Do(key, func() (any, error) {
+		ran = true
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cfg.StoreTimeout)
 		defer cancel()
 
@@ -168,14 +170,19 @@ func (s *Store) Get(ctx context.Context, key string) (link.Link, error) {
 		case errors.Is(err, link.ErrNotFound):
 			e = entry{Found: false}
 		case err != nil:
+			s.lookup("store_error")
 			return nil, err
 		default:
 			e = newEntry(l)
 		}
+		s.lookup("store")
 		s.setRedis(ctx, key, e)
 		s.l1.Add(key, e)
 		return e, nil
 	})
+	if !ran {
+		s.lookup("coalesced")
+	}
 	if err != nil {
 		return link.Link{}, err
 	}

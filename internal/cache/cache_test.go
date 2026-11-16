@@ -328,3 +328,53 @@ func TestOnLookup(t *testing.T) {
 		})
 	}
 }
+
+// Regression: "store" was counted per caller before the shared read, so
+// concurrent misses and failed reads all looked like store answers.
+func TestOnLookupConcurrentMisses(t *testing.T) {
+	tests := []struct {
+		name       string
+		goroutines int
+		storeDown  bool
+		want       map[string]int
+	}{
+		{name: "one store read, the rest coalesced", goroutines: 50, want: map[string]int{"store": 1, "coalesced": 49}},
+		{name: "failed read", goroutines: 1, storeDown: true, want: map[string]int{"store_error": 1}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var mu sync.Mutex
+			got := map[string]int{}
+			cfg := DefaultConfig()
+			cfg.OnLookup = func(outcome string) { mu.Lock(); got[outcome]++; mu.Unlock() }
+			c, backing, _ := newTestCache(t, cfg)
+			mustCreate(t, backing.Store, link.Link{Key: "hot1234", LongURL: "https://example.com"})
+			if tt.storeDown {
+				c.next = failingStore{}
+			}
+			backing.release = make(chan struct{})
+			var wg sync.WaitGroup
+			for range tt.goroutines {
+				wg.Go(func() { _, _ = c.Get(context.Background(), "hot1234") })
+			}
+			time.Sleep(100 * time.Millisecond) // let every caller reach the miss path
+			close(backing.release)
+			wg.Wait()
+			if len(got) != len(tt.want) {
+				t.Fatalf("outcomes = %v, want %v", got, tt.want)
+			}
+			for k, v := range tt.want {
+				if got[k] != v {
+					t.Errorf("outcomes = %v, want %v", got, tt.want)
+				}
+			}
+		})
+	}
+}
+
+// failingStore fails every read, like an unreachable database.
+type failingStore struct{ link.Store }
+
+func (failingStore) Get(context.Context, string) (link.Link, error) {
+	return link.Link{}, errors.New("cassandra unavailable")
+}

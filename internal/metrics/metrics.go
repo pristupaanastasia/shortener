@@ -37,7 +37,7 @@ func New() *Metrics {
 		}, []string{"route"}),
 		cacheLookups: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "cache_lookups_total",
-			Help: "Link lookups by the level that answered: l1, redis or store.",
+			Help: "Link lookups by outcome: l1 or redis (cache hits), store (a store read, once per group of concurrent misses), coalesced (a miss that waited for another caller's store read) or store_error.",
 		}, []string{"level"}),
 	}
 	m.registry.MustRegister(
@@ -77,9 +77,22 @@ func (m *Metrics) Middleware(next http.Handler) http.Handler {
 		if route == "" {
 			route = "unmatched"
 		}
-		m.requests.WithLabelValues(route, r.Method, strconv.Itoa(sw.status)).Inc()
+		m.requests.WithLabelValues(route, methodLabel(r.Method), strconv.Itoa(sw.status)).Inc()
 		m.duration.WithLabelValues(route).Observe(time.Since(start).Seconds())
 	})
+}
+
+// methodLabel maps the request method to a fixed set. Clients choose the
+// method freely ("M1X /a" is a valid request), so using it as is would let
+// anyone create unlimited time series.
+func methodLabel(method string) string {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut,
+		http.MethodPatch, http.MethodDelete, http.MethodOptions:
+		return method
+	default:
+		return "other"
+	}
 }
 
 type statusWriter struct {
