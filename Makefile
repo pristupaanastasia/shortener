@@ -31,7 +31,8 @@ smoke-full:
 	CLICKHOUSE_DSN="clickhouse://shortener:shortener@127.0.0.1:9000/shortener" \
 	./scripts/smoke.sh
 
-# k6 load test against the `make up` stack (needs Docker).
+# Load test against the `make up` stack; fails if the latency requirements
+# are not met. Tune with REDIRECT_RATE, CREATE_RATE, DURATION, LINKS.
 loadtest:
 	./scripts/loadtest.sh
 

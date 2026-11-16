@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/http/pprof"
 	"net/url"
 	"os"
 	"os/signal"
@@ -216,12 +217,15 @@ func run(logger *slog.Logger) error {
 	}
 
 	errc := make(chan error, 2)
-	// Metrics are served on a separate port, so they are not exposed with
-	// the public API.
+	// Metrics and profiling are served on a separate port, so they are not
+	// exposed with the public API.
 	var metricsSrv *http.Server
 	if cfg.metricsAddr != "" {
 		mux := http.NewServeMux()
 		mux.Handle("GET /metrics", m.Handler())
+		mux.HandleFunc("GET /debug/pprof/", pprof.Index)
+		mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
 		metricsSrv = &http.Server{Addr: cfg.metricsAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 		go func() {
 			if err := metricsSrv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
