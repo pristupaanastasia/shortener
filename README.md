@@ -674,5 +674,14 @@ The latency requirements (redirect p99 < 100 ms, create p99 < 500 ms) and the > 
 ### Bottlenecks
 
 1. **First bottleneck: the test bed itself.** k6 running in Docker Desktop capped at ~23.4K requests/s and added ~15 ms to p99 through the virtual network, while the service used ~1.1 of 12 cores. The same service with a native generator served 30K/s with p99 1.2 ms. **Addressed:** `make loadtest` now runs vegeta natively and checks the latency requirements itself. At ~50K/s the native generator runs out of ephemeral ports on the client side (`bind: can't assign requested address`), so higher read loads need a load generator on separate machines.
-2. **First bottleneck in the code: Redis round trips on the write path.** At 10K creates/s, the rate limiter's `INCR`+`EXPIRE` transaction takes 15% of the service's CPU and the negative-cache `DEL` on create ~9.5%, against 4% for the Cassandra LWT itself. Not addressed yet, because it only matters at over 3× the design write peak. When it does: count rate limits locally and flush increments to Redis in batches (an approximate limit, trading accuracy for one round trip per batch instead of per request), and skip the negative-cache `DEL` for generated keys (a random key is practically never looked up before it exists; only aliases need it).
+2. **First bottleneck in the code: Redis round trips on the write path.** At 10K creates/s, the rate limiter's per-request `INCR`+`EXPIRE` transaction and the negative-cache `DEL` on create together cost far more CPU than the Cassandra LWT itself. **Addressed in M7:** rate limits are counted in memory and synced to Redis in batches every 100 ms (approximate: instances together can admit up to one sync interval's worth of extra requests), and the `DEL` is skipped for generated keys (a random key is practically never looked up before it exists; aliases still drop their entry). Same load before and after (10K creates/s + 100 redirects/s, one run each):
+
+   | | Before | After |
+   |---|---|---|
+   | Rate limiter, share of service CPU | 12.8% | < 0.1% (no samples, including the sync loop) |
+   | Negative-cache `DEL` | 8.6% | 0% for generated keys |
+   | Cassandra LWT | 4.0% | 5.6% (same work, smaller total) |
+   | Service CPU | 1.54 cores | 1.20 cores (−22%) |
+   | Create latency, mean / p99 | 6.5 / 34.1 ms | 3.1 / 19.7 ms |
+   | Redirect p99 | 8.6 ms | 7.2 ms |
 3. **Next infrastructure limit: the single Cassandra node** at ~3.9 cores for 10K creates/s (Paxos for every LWT). In production, writes spread over a multi-node cluster.
