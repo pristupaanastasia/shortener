@@ -1,0 +1,33 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: shortener
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: shortener
+resources:
+  - namespace.yaml
+  - shortener.yaml
+  - consumer.yaml
+configMapGenerator:
+  # Addresses of the dependencies as in-cluster Service names; overlays
+  # replace them for their environment. Credentials live in the Secret
+  # shortener-secrets, which every overlay must provide.
+  - name: shortener-config
+    literals:
+      - STORAGE=cassandra
+      - CASSANDRA_HOSTS=cassandra
+      - CASSANDRA_REPLICATION_FACTOR=3
+      - REDIS_ADDR=redis:6379
+      - KAFKA_BROKERS=kafka:9092
+      - ADDR=:8080
+      # Inside the pod: the pod network is isolated, and Prometheus scrapes
+      # this port.
+      - METRICS_ADDR=:9091
+      - BASE_URL=https://sho.rt
+secretGenerator:
+  # Declared here (empty) so that the Deployments' references follow the
+  # generated name; every overlay fills it with behavior: merge.
+  - name: shortener-secrets
+    literals:
+      - POSTGRES_DSN=
+      - CLICKHOUSE_DSN=
