@@ -32,7 +32,7 @@ STORAGE=cassandra REDIS_ADDR=127.0.0.1:6379 \
 POSTGRES_DSN="postgres://shortener:shortener@127.0.0.1:5432/shortener?sslmode=disable" \
 KAFKA_BROKERS=127.0.0.1:9092 KAFKA_TOPIC="loadtest-$(date +%s)" \
 RATE_LIMIT_ANONYMOUS=100000000 RATE_LIMIT_USER=100000000 \
-ADDR=":$port" METRICS_ADDR=":$metrics_port" BASE_URL="$base" \
+ADDR=":$port" METRICS_ADDR="127.0.0.1:$metrics_port" BASE_URL="$base" \
 	"$work/shortener" >"$work/server.log" 2>&1 &
 pid=$!
 trap 'kill -INT "$pid" 2>/dev/null || true; rm -rf "$work"' EXIT

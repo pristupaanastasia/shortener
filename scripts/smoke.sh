@@ -32,7 +32,7 @@ fi
 # Several smoke runs per minute from 127.0.0.1 (the pre-push hook, CI,
 # concurrent runs) would exceed the default anonymous limit of 10/min.
 metrics_port="${SMOKE_METRICS_PORT:-$((port + 1))}"
-RATE_LIMIT_ANONYMOUS=1000 METRICS_ADDR=":$metrics_port" ADDR=":$port" BASE_URL="$base" "$work/shortener" >"$log" 2>&1 &
+RATE_LIMIT_ANONYMOUS=1000 METRICS_ADDR="127.0.0.1:$metrics_port" ADDR=":$port" BASE_URL="$base" "$work/shortener" >"$log" 2>&1 &
 pid=$!
 consumer_pid=""
 if $analytics; then

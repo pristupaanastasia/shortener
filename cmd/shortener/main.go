@@ -34,7 +34,7 @@ import (
 
 type config struct {
 	addr        string
-	metricsAddr string // empty: no metrics endpoint
+	metricsAddr string // empty: no metrics and pprof server
 	baseURL     string
 	storage     string
 	cassandra   cassandra.Config
@@ -54,7 +54,7 @@ type config struct {
 func loadConfig() (config, error) {
 	cfg := config{
 		addr:        getenv("ADDR", ":8080"),
-		metricsAddr: getenv("METRICS_ADDR", ":9091"),
+		metricsAddr: metricsAddr(),
 		baseURL:     getenv("BASE_URL", "http://localhost:8080"),
 		storage:     getenv("STORAGE", "memory"),
 		redisAddr:   os.Getenv("REDIS_ADDR"),
@@ -124,6 +124,17 @@ func openStore(ctx context.Context, cfg config) (link.Store, func(), error) {
 	default:
 		return nil, nil, fmt.Errorf("STORAGE must be memory or cassandra, got %q", cfg.storage)
 	}
+}
+
+// metricsAddr serves /metrics and /debug/pprof on localhost by default:
+// profiles expose memory contents and must not reach the network unless
+// asked for (e.g. METRICS_ADDR=:9091 for a Prometheus scraping from outside
+// the host). An explicitly empty METRICS_ADDR disables the server.
+func metricsAddr() string {
+	if v, ok := os.LookupEnv("METRICS_ADDR"); ok {
+		return v
+	}
+	return "127.0.0.1:9091"
 }
 
 func getenv(key, fallback string) string {
@@ -237,7 +248,7 @@ func run(logger *slog.Logger) error {
 	}
 	go func() {
 		logger.Info("listening", "addr", cfg.addr, "base_url", cfg.baseURL, "storage", cfg.storage, "redis", cfg.redisAddr != "", "postgres", cfg.postgresDSN != "",
-			"kafka", len(cfg.kafkaBrokers) > 0, "clickhouse", cfg.clickhouseDSN != "")
+			"kafka", len(cfg.kafkaBrokers) > 0, "clickhouse", cfg.clickhouseDSN != "", "metrics_addr", cfg.metricsAddr)
 		errc <- srv.ListenAndServe()
 	}()
 

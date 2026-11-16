@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"os"
 	"testing"
 )
 
@@ -13,7 +14,7 @@ func TestLoadConfig(t *testing.T) {
 		check   func(t *testing.T, cfg config)
 	}{
 		{name: "defaults", check: func(t *testing.T, cfg config) {
-			if cfg.addr != ":8080" || cfg.metricsAddr != ":9091" || cfg.baseURL != "http://localhost:8080" || cfg.storage != "memory" {
+			if cfg.addr != ":8080" || cfg.metricsAddr != "127.0.0.1:9091" || cfg.baseURL != "http://localhost:8080" || cfg.storage != "memory" {
 				t.Errorf("cfg = %+v", cfg)
 			}
 			if cfg.cassandra.Keyspace != "shortener" || cfg.cassandra.ReplicationFactor != 1 || len(cfg.cassandra.Hosts) != 1 {
@@ -50,6 +51,18 @@ func TestLoadConfig(t *testing.T) {
 				}
 			},
 		},
+		{name: "metrics on all interfaces when asked", env: map[string]string{"METRICS_ADDR": ":9091"},
+			check: func(t *testing.T, cfg config) {
+				if cfg.metricsAddr != ":9091" {
+					t.Errorf("metricsAddr = %q", cfg.metricsAddr)
+				}
+			}},
+		{name: "empty metrics address disables the server", env: map[string]string{"METRICS_ADDR": ""},
+			check: func(t *testing.T, cfg config) {
+				if cfg.metricsAddr != "" {
+					t.Errorf("metricsAddr = %q, want empty", cfg.metricsAddr)
+				}
+			}},
 		{name: "relative base url", env: map[string]string{"BASE_URL": "/short"}, wantErr: true},
 		{name: "base url without scheme", env: map[string]string{"BASE_URL": "sho.rt"}, wantErr: true},
 		{name: "replication factor not a number", env: map[string]string{"CASSANDRA_REPLICATION_FACTOR": "three"}, wantErr: true},
@@ -59,7 +72,12 @@ func TestLoadConfig(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			for _, k := range []string{"ADDR", "METRICS_ADDR", "BASE_URL", "STORAGE", "CASSANDRA_HOSTS", "CASSANDRA_KEYSPACE", "CASSANDRA_REPLICATION_FACTOR", "REDIS_ADDR", "POSTGRES_DSN", "KAFKA_BROKERS", "KAFKA_TOPIC", "CLICKHOUSE_DSN", "COUNTRY_HEADER", "RATE_LIMIT_ANONYMOUS", "RATE_LIMIT_USER"} {
-				t.Setenv(k, tt.env[k])
+				if v, ok := tt.env[k]; ok {
+					t.Setenv(k, v)
+				} else {
+					t.Setenv(k, "") // restored after the test
+					os.Unsetenv(k)
+				}
 			}
 			cfg, err := loadConfig()
 			if (err != nil) != tt.wantErr {
