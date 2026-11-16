@@ -9,3 +9,6 @@ coverage.out
 
 # Local environment
 .env
+
+# Binaries built from scripts/ with go build
+/deltopics
