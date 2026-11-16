@@ -16,6 +16,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/sync/singleflight"
 
+	"github.com/pristupaanastasia/shortener/internal/breaker"
 	"github.com/pristupaanastasia/shortener/internal/link"
 )
 
@@ -248,7 +249,7 @@ func (s *Store) Invalidate(ctx context.Context, key string) {
 func (s *Store) drop(ctx context.Context, key string) {
 	s.l1.Remove(key)
 	if err := s.redis.Del(ctx, redisKey(key)).Err(); err != nil {
-		s.logger.Warn("cache delete failed", "key", key, "err", err)
+		s.warnRedis("cache delete failed", key, err)
 	}
 }
 
@@ -260,7 +261,7 @@ func (s *Store) getRedis(ctx context.Context, key string) (entry, bool) {
 		return entry{}, false
 	}
 	if err != nil {
-		s.logger.Warn("cache get failed", "key", key, "err", err)
+		s.warnRedis("cache get failed", key, err)
 		return entry{}, false
 	}
 	var e entry
@@ -278,8 +279,17 @@ func (s *Store) setRedis(ctx context.Context, key string, e entry) {
 		return
 	}
 	if err := s.redis.Set(ctx, redisKey(key), data, s.ttl(e)).Err(); err != nil {
-		s.logger.Warn("cache set failed", "key", key, "err", err)
+		s.warnRedis("cache set failed", key, err)
 	}
+}
+
+// warnRedis logs a Redis failure, except while the circuit breaker is open:
+// the breaker logs that once, and a warning per call would flood the log.
+func (s *Store) warnRedis(msg, key string, err error) {
+	if errors.Is(err, breaker.ErrOpen) {
+		return
+	}
+	s.logger.Warn(msg, "key", key, "err", err)
 }
 
 func (s *Store) ttl(e entry) time.Duration {

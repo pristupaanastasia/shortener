@@ -18,6 +18,7 @@ import (
 
 	"github.com/pristupaanastasia/shortener/internal/account"
 	"github.com/pristupaanastasia/shortener/internal/analytics"
+	"github.com/pristupaanastasia/shortener/internal/breaker"
 	"github.com/pristupaanastasia/shortener/internal/cache"
 	"github.com/pristupaanastasia/shortener/internal/httpapi"
 	"github.com/pristupaanastasia/shortener/internal/idempotency"
@@ -191,7 +192,16 @@ func run(logger *slog.Logger) error {
 	m := metrics.New()
 	api := httpapi.Config{BaseURL: cfg.baseURL, Logger: logger, AnonymousLimit: cfg.anonymousLimit, UserLimit: cfg.userLimit}
 	if cfg.redisAddr != "" {
+		// One breaker for both clients: they talk to the same Redis. While it
+		// is open, cache, rate limiter and idempotency skip Redis at once
+		// instead of waiting for its timeout on every call.
+		cb := newRedisBreaker(logger)
+		m.Register(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "redis_circuit_state",
+			Help: "State of the Redis circuit breaker: 0 closed, 1 half-open, 2 open.",
+		}, func() float64 { return float64(cb.State()) }))
 		rdb := cache.NewRedisClient(cfg.redisAddr)
+		rdb.AddHook(breaker.Hook(cb))
 		defer rdb.Close()
 		cacheCfg := cache.DefaultConfig()
 		cacheCfg.OnLookup = m.CacheLookup
@@ -206,6 +216,7 @@ func run(logger *slog.Logger) error {
 		limiterOpts := cache.RedisOptions(cfg.redisAddr)
 		limiterOpts.MaxRetries = -1
 		limiterRDB := redis.NewClient(limiterOpts)
+		limiterRDB.AddHook(breaker.Hook(cb))
 		defer limiterRDB.Close()
 		if cfg.rateLimitSync > 0 {
 			limiter := ratelimit.NewBatched(limiterRDB, cfg.rateLimitSync, logger)
@@ -297,4 +308,21 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("listen: %w", err)
 	}
 	return nil
+}
+
+// newRedisBreaker returns the Redis circuit breaker; it logs each state change
+// once, in place of a warning per failed call.
+func newRedisBreaker(logger *slog.Logger) *breaker.Breaker {
+	cfg := breaker.DefaultConfig()
+	cfg.OnChange = func(from, to breaker.State) {
+		// A failed half-open probe reopens the breaker every cooldown; only
+		// the first opening is worth a warning.
+		switch {
+		case to == breaker.Open && from == breaker.Closed:
+			logger.Warn("redis circuit open: skipping Redis until it recovers", "cooldown", cfg.Cooldown)
+		case to == breaker.Closed:
+			logger.Info("redis circuit closed: Redis recovered")
+		}
+	}
+	return breaker.New(cfg)
 }

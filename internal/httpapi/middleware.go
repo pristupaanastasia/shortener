@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/pristupaanastasia/shortener/internal/account"
+	"github.com/pristupaanastasia/shortener/internal/breaker"
 	"github.com/pristupaanastasia/shortener/internal/idempotency"
 )
 
@@ -130,7 +131,7 @@ func (h *Handler) checkRateLimit(w http.ResponseWriter, r *http.Request, subject
 	}
 	res, err := h.limiter.Allow(r.Context(), subject, limit, time.Minute)
 	if err != nil {
-		h.logger.Warn("rate limiter unavailable, allowing request", "err", err)
+		h.warnRedis("rate limiter unavailable, allowing request", err)
 		return true
 	}
 	w.Header().Set("X-RateLimit-Limit", strconv.Itoa(res.Limit))
@@ -183,7 +184,7 @@ func (h *Handler) withIdempotency(w http.ResponseWriter, r *http.Request, handle
 
 	rec, started, err := h.idempotency.Begin(r.Context(), scope, key, fingerprint)
 	if err != nil {
-		h.logger.Warn("idempotency store unavailable, processing without it", "err", err)
+		h.warnRedis("idempotency store unavailable, processing without it", err)
 		handle(w, body)
 		return
 	}
@@ -214,14 +215,14 @@ func (h *Handler) withIdempotency(w http.ResponseWriter, r *http.Request, handle
 	// Client errors are deterministic and are replayed like successes.
 	if rw.status >= http.StatusInternalServerError {
 		if err := h.idempotency.Abort(ctx, scope, key); err != nil {
-			h.logger.Warn("release idempotency key", "err", err)
+			h.warnRedis("release idempotency key", err)
 		}
 	} else {
 		err := h.idempotency.Complete(ctx, scope, key, idempotency.Record{
 			Fingerprint: fingerprint, Status: rw.status, Body: rw.body.Bytes(),
 		})
 		if err != nil {
-			h.logger.Warn("store idempotent response", "err", err)
+			h.warnRedis("store idempotent response", err)
 		}
 	}
 	rw.flush(w)
@@ -244,4 +245,14 @@ func (r *recorder) flush(w http.ResponseWriter) {
 	}
 	w.WriteHeader(r.status)
 	_, _ = w.Write(r.body.Bytes())
+}
+
+// warnRedis logs a failure of a Redis-backed dependency, except while the
+// circuit breaker is open: the breaker logs that once, and a warning per
+// request would flood the log.
+func (h *Handler) warnRedis(msg string, err error) {
+	if errors.Is(err, breaker.ErrOpen) {
+		return
+	}
+	h.logger.Warn(msg, "err", err)
 }

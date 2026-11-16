@@ -76,7 +76,7 @@ The consumer (`cmd/consumer`) reads `KAFKA_BROKERS`, `KAFKA_TOPIC`, `KAFKA_GROUP
 | Level | Command | What it covers |
 |---|---|---|
 | Lint | `make lint` | `gofmt`, `go vet` (including integration-tagged files) |
-| Unit | `make test` | 78 test functions with the race detector; Redis via miniredis, stores in memory |
+| Unit | `make test` | 88 test functions with the race detector; Redis via miniredis, stores in memory |
 | Integration | `make test-integration` | + 19 test functions against the `make up` stack: Cassandra LWTs and concurrent inserts, migrations on fresh databases, ClickHouse aggregates, the Kafka pipeline with a failing sink, real Redis |
 | Smoke | `make smoke`, `make smoke-full` | builds and starts the real binaries and walks through the user journey with curl (15 checks in memory, 17 on the full stack: register, create, redirect, patch, list, click statistics, delete, auth errors, metrics, clean shutdown) |
 | Coverage gate | `make coverage` | unit + integration tests and `smoke-full` (its binaries are built with `-cover`); fails below 80% |
@@ -87,11 +87,11 @@ Tests are table-driven (`.claude/skills/go-table-tests`); every database has mig
 
 **Where they run:** the pre-push hook (`make hooks`) runs lint and `make coverage` on the tip of every pushed branch, so pushing needs `make up`. CI (`.github/workflows/ci.yml`) runs the same on every push and pull request against service containers.
 
-**Latest results** (2026-11-16, branch `milestone/m8-kubernetes`):
+**Latest results** (2026-11-16, branch `milestone/m9-redis-circuit-breaker`):
 
 | Check | Result |
 |---|---|
-| Unit + integration | 97 test functions, 395 cases, all passing |
+| Unit + integration | 107 test functions, 430 cases, all passing |
 | Coverage | 89.6% of statements (minimum 80%) |
 | Smoke | 15/15 in memory, 17/17 on the full stack, 14/14 against minikube |
 | Load | redirects: 30K/s with p99 1.2 ms; creates: 10K/s with p99 19.7 ms (after M7); 0 errors |
@@ -586,6 +586,7 @@ All services are **stateless**: state lives only in the storage layer, so servic
    - The result is cached in Redis with `TTL = 1h + random(0, 10m)`. The jitter keeps entries that were cached together from expiring together (cache avalanche). Expired and deleted links are cached too: the service checks `expires_at`/`deleted_at` on every read, so 410 is served from cache.
    - **Negative caching:** a missing key is cached as "not found" for 1 minute. Otherwise a bot enumerating random keys would bypass the cache and flood Cassandra. Creating an alias drops its negative entry, so a new alias resolves immediately (other instances' L1 may serve 404 for up to 10s). For generated keys this Redis round trip is skipped (it was 8.6% of service CPU at 10K creates/s): a random key is practically never looked up before it exists, so the rare stale "not found" lasts at most the 1-minute negative TTL.
    - **Redis failures are treated as misses**, never as errors. The Redis client uses tight timeouts and minimal retries: with library defaults, an unavailable Redis added ~5 s to every request (measured in tests).
+   - **Circuit breaker** (`internal/breaker`): after 5 consecutive Redis failures, every Redis call fails at once for 2 s, then one probe decides whether to close. A missing key and an error reply from the server count as answers, not failures. It is a go-redis hook shared by all Redis clients, so cache, rate limiter and idempotency skip Redis together. While it is open, nothing is logged per call: the opening and the recovery are logged once each, and `redis_circuit_state` (0 closed, 1 half-open, 2 open) shows the state.
 4. **Checks and response:**
    - `deleted_at` set or `expires_at` in the past: **410**;
    - not found: **404**;
@@ -594,10 +595,19 @@ All services are **stateless**: state lives only in the storage layer, so servic
 
 **Latency** (measured locally): L1 hit ~0.3 ms, cache miss to Cassandra ~5 ms, Redis down ~10 ms on the first miss, then L1 again. Well within the 100 ms budget.
 
+**Hung Redis** (accepts connections, never answers), 200 redirects/s over 20 links for 20 s:
+
+| | p50 | p99 | Warnings logged |
+|---|---|---|---|
+| Without the breaker | 0.23 ms | 105 ms (over the 100 ms requirement) | 164 |
+| With the breaker | 0.24 ms | 0.98 ms | 20, almost all in the first instant: calls already waiting for Redis when the breaker opened |
+
+With the real Redis frozen (`docker compose pause redis`), the breaker opened, cache misses stopped waiting for Redis, and after `unpause` the first probe closed it.
+
 **Known limitations:**
 
-- A Redis that hangs (accepts connections but does not respond) costs up to the 50 ms timeout per operation. A circuit breaker would skip Redis entirely after repeated failures.
-- While Redis is down, every miss logs a warning; at production traffic, these logs need rate limiting.
+- Calls already in flight when the breaker opens still wait for their timeout, so each outage starts with a short burst of slow requests and warnings.
+- The breaker is per instance: each instance spends a few slow calls to discover an outage.
 
 ### Flow 2: Create a link
 
