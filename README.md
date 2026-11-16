@@ -2,6 +2,102 @@
 
 A learning project: system design of a URL shortening service (like bit.ly / TinyURL) and its implementation in Go.
 
+The first two sections show how to run and test it; the rest is the design document.
+
+## Running
+
+### Local Setup
+
+```
+              host                                    docker compose (make up)
+ ┌────────────────────────────────┐        ┌──────────────────────────────────────┐
+ │ shortener   :8080  API+redirect│───────▶│ Cassandra :9042   links              │
+ │             :9091  /metrics,   │───────▶│ Redis     :6379   cache, rate limits │
+ │                    /debug/pprof│───────▶│ PostgreSQL:5432   users, API keys    │
+ │                                │──clicks▶ Kafka     :9092   click events       │
+ │ consumer           (no port)   │◀───────│                                      │
+ │                                │───────▶│ ClickHouse:9000   click statistics   │
+ └────────────────────────────────┘        └──────────────────────────────────────┘
+```
+
+Requirements: Go 1.26.3 and Docker. Every dependency is optional: without any, the service runs fully in memory.
+
+```
+make run                      # in memory: links, accounts and rate limits in the process
+
+make up                       # Cassandra, Redis, PostgreSQL, Kafka, ClickHouse
+STORAGE=cassandra \
+REDIS_ADDR=127.0.0.1:6379 \
+POSTGRES_DSN='postgres://shortener:shortener@127.0.0.1:5432/shortener?sslmode=disable' \
+KAFKA_BROKERS=127.0.0.1:9092 \
+CLICKHOUSE_DSN='clickhouse://shortener:shortener@127.0.0.1:9000/shortener' \
+  go run ./cmd/shortener      # full stack on :8080
+
+KAFKA_BROKERS=127.0.0.1:9092 \
+CLICKHOUSE_DSN='clickhouse://shortener:shortener@127.0.0.1:9000/shortener' \
+  go run ./cmd/consumer       # analytics: Kafka -> ClickHouse
+
+make down                     # stop the dependencies (data stays in volumes)
+```
+
+Schemas are applied on startup from `migrations/`. A quick check:
+
+```
+curl -s -X POST localhost:8080/api/v1/users -d '{"email":"me@example.com"}'          # -> api_key
+curl -s -X POST localhost:8080/api/v1/links -d '{"long_url":"https://example.com"}'  # -> short_url
+curl -si localhost:8080/<key>                                                         # -> 301
+```
+
+For Kubernetes (minikube), see [Deployment (Kubernetes)](#deployment-kubernetes).
+
+### Configuration
+
+All settings are environment variables.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ADDR` | `:8080` | API and redirect address |
+| `BASE_URL` | `http://localhost:8080` | prefix of returned `short_url`; its host is rejected as a long URL (redirect loops) |
+| `METRICS_ADDR` | `127.0.0.1:9091` | `/metrics` and `/debug/pprof`; localhost only by default, empty disables |
+| `STORAGE` | `memory` | `memory` or `cassandra` |
+| `CASSANDRA_HOSTS` / `CASSANDRA_KEYSPACE` / `CASSANDRA_REPLICATION_FACTOR` | `127.0.0.1` / `shortener` / `1` | Cassandra connection; the keyspace is created if missing |
+| `POSTGRES_DSN` | empty: in-memory accounts | users and API keys; required with `STORAGE=cassandra` |
+| `REDIS_ADDR` | empty: no cache, rate limiting or `Idempotency-Key` | Redis address |
+| `RATE_LIMIT_ANONYMOUS` / `RATE_LIMIT_USER` | `10` / `100` | requests per minute per IP / per user |
+| `RATE_LIMIT_SYNC_INTERVAL` | `100ms` | how often rate-limit counters sync to Redis; `0` = exact per-request counting |
+| `KAFKA_BROKERS` / `KAFKA_TOPIC` | empty: no click events / `clicks` | click event publishing |
+| `CLICKHOUSE_DSN` | empty: `/stats` returns 503 | statistics; connected lazily, so redirects work while ClickHouse is down |
+| `COUNTRY_HEADER` | empty | header with the client's country set by the CDN (e.g. `CF-IPCountry`) |
+
+The consumer (`cmd/consumer`) reads `KAFKA_BROKERS`, `KAFKA_TOPIC`, `KAFKA_GROUP` (`analytics`), `CLICKHOUSE_DSN`, `BATCH_SIZE` (`10000`) and `FLUSH_INTERVAL` (`1s`).
+
+## Testing
+
+| Level | Command | What it covers |
+|---|---|---|
+| Lint | `make lint` | `gofmt`, `go vet` (including integration-tagged files) |
+| Unit | `make test` | 78 test functions with the race detector; Redis via miniredis, stores in memory |
+| Integration | `make test-integration` | + 19 test functions against the `make up` stack: Cassandra LWTs and concurrent inserts, migrations on fresh databases, ClickHouse aggregates, the Kafka pipeline with a failing sink, real Redis |
+| Smoke | `make smoke`, `make smoke-full` | builds and starts the real binaries and walks through the user journey with curl (15 checks in memory, 17 on the full stack: register, create, redirect, patch, list, click statistics, delete, auth errors, metrics, clean shutdown) |
+| Coverage gate | `make coverage` | unit + integration tests and `smoke-full` (its binaries are built with `-cover`); fails below 80% |
+| Load | `make loadtest` | redirects and creates at once with vegeta; fails if redirect p99 ≥ 100 ms, create p99 ≥ 500 ms or success < 99%; see [Load Test Results](#load-test-results) |
+| Kubernetes | `make k8s-smoke`, `make k8s-rollout` | the smoke test against the cluster; a rolling restart under 200 requests/s from inside the cluster with no failed requests allowed |
+
+Tests are table-driven (`.claude/skills/go-table-tests`); every database has migration and query tests (`.claude/skills/db-migrations`).
+
+**Where they run:** the pre-push hook (`make hooks`) runs lint and `make coverage` on the tip of every pushed branch, so pushing needs `make up`. CI (`.github/workflows/ci.yml`) runs the same on every push and pull request against service containers.
+
+**Latest results** (2026-11-16, branch `milestone/m8-kubernetes`):
+
+| Check | Result |
+|---|---|
+| Unit + integration | 97 test functions, 395 cases, all passing |
+| Coverage | 89.6% of statements (minimum 80%) |
+| Smoke | 15/15 in memory, 17/17 on the full stack, 14/14 against minikube |
+| Load | redirects: 30K/s with p99 1.2 ms; creates: 10K/s with p99 19.7 ms (after M7); 0 errors |
+| Rolling restart in Kubernetes | 9000 of 9000 requests succeeded |
+| CI | green, ~2.5 min (~4.5 min when `go.sum` changes and the module cache is rebuilt) |
+
 ## Functional Requirements
 
 ### Core
