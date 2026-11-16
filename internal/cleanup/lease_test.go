@@ -12,6 +12,7 @@ type fakeLease struct {
 	mu        sync.Mutex
 	holder    string
 	renewOK   bool
+	renewErrs int // the first renewals fail with an error
 	renewals  int
 	released  bool
 	acquireEr error
@@ -34,6 +35,9 @@ func (l *fakeLease) RenewLease(context.Context, string, string, time.Duration) (
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.renewals++
+	if l.renewals <= l.renewErrs {
+		return false, errors.New("write timeout")
+	}
 	return l.renewOK, nil
 }
 
@@ -106,19 +110,27 @@ func TestWithLeaseRenews(t *testing.T) {
 		name         string
 		work         time.Duration
 		ttl          time.Duration
+		renewErrs    int
+		wantErr      error
 		wantRenewals int // at least
 	}{
 		{name: "renews every ttl/3 during long work", work: 100 * time.Millisecond, ttl: 30 * time.Millisecond, wantRenewals: 5},
+		{name: "one failed renewal is retried", work: 100 * time.Millisecond, ttl: 30 * time.Millisecond, renewErrs: 1, wantRenewals: 5},
+		{name: "failing for 2/3 of the ttl loses the lease", work: time.Second, ttl: 30 * time.Millisecond, renewErrs: 1000, wantErr: ErrLeaseLost, wantRenewals: 2},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			l := &fakeLease{renewOK: true}
-			_, err := WithLease(context.Background(), l, "links", "me", tt.ttl, func(context.Context) error {
-				time.Sleep(tt.work)
-				return nil
+			l := &fakeLease{renewOK: true, renewErrs: tt.renewErrs}
+			_, err := WithLease(context.Background(), l, "links", "me", tt.ttl, func(ctx context.Context) error {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(tt.work):
+					return nil
+				}
 			})
-			if err != nil {
-				t.Fatal(err)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("err = %v, want %v", err, tt.wantErr)
 			}
 			if l.renewals < tt.wantRenewals {
 				t.Errorf("renewals = %d, want at least %d", l.renewals, tt.wantRenewals)

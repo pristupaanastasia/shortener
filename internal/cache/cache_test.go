@@ -139,20 +139,35 @@ func TestCachedExpiredLinkStaysExpired(t *testing.T) {
 
 func TestRedisTTL(t *testing.T) {
 	tests := []struct {
-		name    string
-		key     string
-		exists  bool
-		wantMin time.Duration
-		wantMax time.Duration // exclusive
+		name      string
+		key       string
+		exists    bool
+		expiresIn time.Duration // 0: permanent
+		deleted   bool
+		wantMin   time.Duration
+		wantMax   time.Duration // exclusive
 	}{
 		{name: "found link: 1h plus jitter", key: "abc1234", exists: true, wantMin: time.Hour, wantMax: time.Hour + 10*time.Minute},
 		{name: "missing link: negative ttl", key: "missing", exists: false, wantMin: time.Minute, wantMax: time.Minute + time.Nanosecond},
+		{name: "expiring link: not past expires_at", key: "soon", exists: true, expiresIn: 10 * time.Minute, wantMin: 9 * time.Minute, wantMax: 10*time.Minute + time.Nanosecond},
+		{name: "expiring link far ahead: 1h plus jitter", key: "later", exists: true, expiresIn: 48 * time.Hour, wantMin: time.Hour, wantMax: time.Hour + 10*time.Minute},
+		{name: "expired link awaiting cleanup: negative ttl", key: "expired", exists: true, expiresIn: -time.Minute, wantMin: time.Minute, wantMax: time.Minute + time.Nanosecond},
+		{name: "deleted link: 1h plus jitter", key: "deleted", exists: true, deleted: true, wantMin: time.Hour, wantMax: time.Hour + 10*time.Minute},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c, backing, mr := newTestCache(t, DefaultConfig())
 			if tt.exists {
-				mustCreate(t, backing.Store, link.Link{Key: tt.key, LongURL: "https://example.com"})
+				l := link.Link{Key: tt.key, LongURL: "https://example.com"}
+				if tt.expiresIn != 0 {
+					at := time.Now().Add(tt.expiresIn)
+					l.ExpiresAt = &at
+				}
+				if tt.deleted {
+					at := time.Now()
+					l.DeletedAt = &at
+				}
+				mustCreate(t, backing.Store, l)
 			}
 			_, _ = c.Get(context.Background(), tt.key)
 			if ttl := mr.TTL(redisKey(tt.key)); ttl < tt.wantMin || ttl >= tt.wantMax {

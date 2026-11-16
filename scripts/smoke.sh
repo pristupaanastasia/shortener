@@ -44,8 +44,9 @@ fi
 cleanup=false
 if ! $external && [ "${STORAGE:-}" = cassandra ] && [ -n "${ARCHIVE_ENDPOINT:-}" ]; then
 	cleanup=true
-	# Objects of smoke runs stay apart from real archives.
-	export ARCHIVE_PREFIX="smoke/"
+	# A keyspace and an archive prefix of their own: the worker archives
+	# every expired link it finds, and must not take development links.
+	export CASSANDRA_KEYSPACE=shortener_smoke ARCHIVE_PREFIX="smoke/"
 fi
 
 pid=""
@@ -155,7 +156,7 @@ if $cleanup; then
 	archived=false
 	for _ in $(seq 1 20); do
 		CLEANUP_LOOKBACK_DAYS=1 "$work/cleanup" >>"$work/cleanup.log" 2>&1 || fail "cleanup failed: $(cat "$work/cleanup.log")"
-		if go run ./scripts/archived "$expiring"; then
+		if go run ./scripts/archived "$expiring" "$expires_at"; then
 			archived=true
 			break
 		fi

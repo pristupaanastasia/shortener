@@ -20,7 +20,9 @@ const expiryBuckets = 256
 // ExpiryBuckets implements cleanup.Store.
 func (s *Store) ExpiryBuckets() int { return expiryBuckets }
 
-func expiryBucket(key string) int {
+// ExpiryBucket returns the bucket of key in links_by_expiry, which is also
+// part of the archive object names.
+func ExpiryBucket(key string) int {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(key))
 	return int(h.Sum32() % expiryBuckets)
@@ -28,7 +30,7 @@ func expiryBucket(key string) int {
 
 func (s *Store) indexExpiry(ctx context.Context, key string, expiresAt time.Time) error {
 	return retry(ctx, func() error {
-		err := s.session.Query(s.insertExpiry, cleanup.Day(expiresAt), expiryBucket(key), expiresAt, key).ExecContext(ctx)
+		err := s.session.Query(s.insertExpiry, cleanup.Day(expiresAt), ExpiryBucket(key), expiresAt, key).ExecContext(ctx)
 		if err != nil {
 			return fmt.Errorf("insert link %q into links_by_expiry: %w", key, err)
 		}
@@ -36,10 +38,17 @@ func (s *Store) indexExpiry(ctx context.Context, key string, expiresAt time.Time
 	})
 }
 
-// Expired implements cleanup.Store.
-func (s *Store) Expired(ctx context.Context, day time.Time, bucket int, before time.Time, limit int) ([]cleanup.Entry, error) {
-	iter := s.session.Query(fmt.Sprintf(`SELECT expires_at, key FROM %s.links_by_expiry
-		WHERE day = ? AND bucket = ? AND expires_at < ? LIMIT ?`, s.ks), day, bucket, before, limit).IterContext(ctx)
+// Expired implements cleanup.Store. The cursor is a slice on the clustering
+// key, so a read never scans the rows before it.
+func (s *Store) Expired(ctx context.Context, day time.Time, bucket int, before time.Time, after *cleanup.Entry, limit int) ([]cleanup.Entry, error) {
+	q := s.session.Query(fmt.Sprintf(`SELECT expires_at, key FROM %s.links_by_expiry
+		WHERE day = ? AND bucket = ? AND expires_at < ? LIMIT ?`, s.ks), day, bucket, before, limit)
+	if after != nil {
+		q = s.session.Query(fmt.Sprintf(`SELECT expires_at, key FROM %s.links_by_expiry
+			WHERE day = ? AND bucket = ? AND (expires_at, key) > (?, ?) AND expires_at < ? LIMIT ?`, s.ks),
+			day, bucket, after.ExpiresAt, after.Key, before, limit)
+	}
+	iter := q.IterContext(ctx)
 	var entries []cleanup.Entry
 	var e cleanup.Entry
 	for iter.Scan(&e.ExpiresAt, &e.Key) {
@@ -49,16 +58,6 @@ func (s *Store) Expired(ctx context.Context, day time.Time, bucket int, before t
 		return nil, fmt.Errorf("select expired links of %s/%d: %w", day.Format(time.DateOnly), bucket, err)
 	}
 	return entries, nil
-}
-
-// DeleteExpiry implements cleanup.Store.
-func (s *Store) DeleteExpiry(ctx context.Context, day time.Time, bucket int, e cleanup.Entry) error {
-	err := s.session.Query(fmt.Sprintf(`DELETE FROM %s.links_by_expiry
-		WHERE day = ? AND bucket = ? AND expires_at = ? AND key = ?`, s.ks), day, bucket, e.ExpiresAt, e.Key).ExecContext(ctx)
-	if err != nil {
-		return fmt.Errorf("delete %q from links_by_expiry: %w", e.Key, err)
-	}
-	return nil
 }
 
 // DeleteExpiryPartition implements cleanup.Store.
@@ -71,12 +70,14 @@ func (s *Store) DeleteExpiryPartition(ctx context.Context, day time.Time, bucket
 	return nil
 }
 
-// Tombstone implements cleanup.Store. The condition on expires_at makes it
-// lose to a concurrent extension: the owner's PATCH wins over the worker.
+// Tombstone implements cleanup.Store. The conditions on expires_at and
+// long_url make it lose to a concurrent PATCH: the owner wins over the
+// worker, and a URL changed after archiving is never nulled unarchived.
 func (s *Store) Tombstone(ctx context.Context, l link.Link, at time.Time) (cleanup.TombstoneResult, error) {
 	current := map[string]any{}
 	applied, err := s.session.Query(fmt.Sprintf(`UPDATE %s.links SET long_url = null, deleted_at = ?
-		WHERE key = ? IF expires_at = ? AND deleted_at = null`, s.ks), at, l.Key, l.ExpiresAt).MapScanCASContext(ctx, current)
+		WHERE key = ? IF expires_at = ? AND long_url = ? AND deleted_at = null`, s.ks),
+		at, l.Key, l.ExpiresAt, l.LongURL).MapScanCASContext(ctx, current)
 	if err != nil {
 		return 0, fmt.Errorf("tombstone link %q: %w", l.Key, err)
 	}

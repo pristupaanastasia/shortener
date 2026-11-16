@@ -43,10 +43,12 @@ func TestRun(t *testing.T) {
 			wantStats: Stats{Archived: 1, Objects: 1}, wantCheckpoint: Day(now),
 		},
 		{
+			// Today's entries stay until the day is over and its partitions
+			// are deleted.
 			name:         "earlier today is expired too, but today stays open",
 			setup:        func(f *fakeStore, _ *fakeArchive) { f.add(expiring("a", now.Add(-time.Hour))) },
 			wantArchived: []string{"a"}, wantTombstoned: []string{"a"},
-			wantStats: Stats{Archived: 1, Objects: 1}, wantCheckpoint: Day(now),
+			wantStats: Stats{Archived: 1, Objects: 1}, wantIndexed: 1, wantCheckpoint: Day(now),
 		},
 		{
 			name:        "link expiring later today is kept",
@@ -90,6 +92,15 @@ func TestRun(t *testing.T) {
 			},
 			wantArchived: []string{"a"}, // an extra record, never a missing one
 			wantStats:    Stats{Skipped: 1, Objects: 1}, wantCheckpoint: Day(now),
+		},
+		{
+			name: "URL change between read and tombstone wins",
+			setup: func(f *fakeStore, _ *fakeArchive) {
+				f.add(expiring("a", now.Add(-time.Hour))) // today: read again next run
+				f.changeURLOnRead = "a"
+			},
+			wantArchived: []string{"a"}, // the old URL; the next run archives the new one
+			wantStats:    Stats{Skipped: 1, Objects: 1}, wantIndexed: 1, wantCheckpoint: Day(now),
 		},
 		{
 			name: "archive down: nothing is tombstoned",
@@ -214,6 +225,42 @@ func TestRunResumesAfterFailure(t *testing.T) {
 	// b and c were archived by both runs, a by the first only.
 	if got, want := a.archivedKeys(), []string{"a", "b", "b", "c", "c"}; !slices.Equal(got, want) {
 		t.Errorf("archived = %v, want %v", got, want)
+	}
+}
+
+// Batches follow one another through the cursor: each read starts after the
+// previous batch, so the reads match the batches, and entries are never
+// deleted one by one (Cassandra tombstones would pile up in the partition).
+func TestRunPagesThroughPartition(t *testing.T) {
+	tests := []struct {
+		name      string
+		links     int
+		batch     int
+		wantReads int // the last read returns nothing
+	}{
+		{name: "exact batches", links: 6, batch: 2, wantReads: 4},
+		{name: "partial last batch", links: 5, batch: 2, wantReads: 4},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f, a := newFakeStore(1), &fakeArchive{}
+			today := Day(now)
+			f.checkpoint = &today // only today's partition is read
+			for i := range tt.links {
+				// Today, so the partition is not deleted afterwards.
+				f.add(expiring(string(rune('a'+i)), now.Add(-time.Duration(i+1)*time.Minute)))
+			}
+			stats, err := newWorker(f, a, tt.batch).Run(context.Background(), now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stats.Archived != tt.links || f.reads != tt.wantReads {
+				t.Errorf("archived %d with %d reads, want %d with %d", stats.Archived, f.reads, tt.links, tt.wantReads)
+			}
+			if got := f.indexed(); got != tt.links {
+				t.Errorf("index entries = %d, want all %d kept", got, tt.links)
+			}
+		})
 	}
 }
 

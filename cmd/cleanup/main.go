@@ -40,11 +40,14 @@ func loadConfig() (config, error) {
 			Endpoint:  getenv("ARCHIVE_ENDPOINT", "127.0.0.1:8333"),
 			Bucket:    getenv("ARCHIVE_BUCKET", "shortener-archive"),
 			Prefix:    os.Getenv("ARCHIVE_PREFIX"),
-			AccessKey: getenv("ARCHIVE_ACCESS_KEY", "shortener"),
-			SecretKey: getenv("ARCHIVE_SECRET_KEY", "shortener"),
+			AccessKey: credential("ARCHIVE_ACCESS_KEY"),
+			SecretKey: credential("ARCHIVE_SECRET_KEY"),
 			Secure:    os.Getenv("ARCHIVE_SECURE") == "true",
 		},
 		cleanup: cleanup.DefaultConfig(),
+	}
+	if cfg.archive.AccessKey == "" || cfg.archive.SecretKey == "" {
+		return config{}, fmt.Errorf("ARCHIVE_ACCESS_KEY and ARCHIVE_SECRET_KEY must not be empty")
 	}
 	var err error
 	if cfg.cassandra.ReplicationFactor, err = strconv.Atoi(getenv("CASSANDRA_REPLICATION_FACTOR", "1")); err != nil || cfg.cassandra.ReplicationFactor < 1 {
@@ -54,6 +57,17 @@ func loadConfig() (config, error) {
 		return config{}, fmt.Errorf("CLEANUP_LOOKBACK_DAYS must be a non-negative integer")
 	}
 	return cfg, nil
+}
+
+// credential returns the variable, or the docker compose development value
+// if it is unset. Set but empty is an error (see loadConfig): the Kubernetes
+// base declares the credentials empty for overlays to fill, and a forgotten
+// one must not fall back to development credentials.
+func credential(key string) string {
+	if v, ok := os.LookupEnv(key); ok {
+		return v
+	}
+	return "shortener"
 }
 
 func getenv(key, fallback string) string {

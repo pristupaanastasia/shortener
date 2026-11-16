@@ -21,7 +21,9 @@ type Lease interface {
 
 // WithLease runs fn while holding the lease, renewing it every ttl/3. It
 // returns held=false without running fn if another owner holds the lease.
-// If a renewal fails, fn's context is cancelled with ErrLeaseLost.
+// fn's context is cancelled with ErrLeaseLost when the lease is taken over,
+// or when renewals keep failing for 2/3 of the TTL (a third of it is left as
+// a margin); a single failed renewal (e.g. a timeout) is retried.
 func WithLease(ctx context.Context, l Lease, name, owner string, ttl time.Duration, fn func(context.Context) error) (held bool, err error) {
 	ok, err := l.AcquireLease(ctx, name, owner, ttl)
 	if err != nil || !ok {
@@ -45,6 +47,7 @@ func WithLease(ctx context.Context, l Lease, name, owner string, ttl time.Durati
 		defer close(renewed)
 		t := time.NewTicker(ttl / 3)
 		defer t.Stop()
+		renewedAt := time.Now()
 		for {
 			select {
 			case <-stop:
@@ -53,7 +56,13 @@ func WithLease(ctx context.Context, l Lease, name, owner string, ttl time.Durati
 				return
 			case <-t.C:
 				ok, err := l.RenewLease(work, name, owner, ttl)
-				if err != nil || !ok {
+				switch {
+				case err == nil && !ok: // someone else holds it now
+					cancel(ErrLeaseLost)
+					return
+				case err == nil:
+					renewedAt = time.Now()
+				case time.Since(renewedAt) >= 2*ttl/3:
 					cancel(errors.Join(ErrLeaseLost, err))
 					return
 				}

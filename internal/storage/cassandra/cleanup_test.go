@@ -23,7 +23,7 @@ func testDay() time.Time {
 
 func indexed(t *testing.T, s *Store, day time.Time, key string) bool {
 	t.Helper()
-	entries, err := s.Expired(context.Background(), day, expiryBucket(key), day.AddDate(0, 0, 1), 1000)
+	entries, err := s.Expired(context.Background(), day, ExpiryBucket(key), day.AddDate(0, 0, 1), nil, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,18 +64,13 @@ func TestExpiryIndex(t *testing.T) {
 		}, key: l.Key, day: otherDay, want: true},
 		{name: "the old entry stays as a hint", action: func(*testing.T) {}, key: l.Key, day: day, want: true},
 		{name: "entries before the cutoff only", action: func(t *testing.T) {
-			got, err := s.Expired(ctx, otherDay, expiryBucket(l.Key), later, 1000)
+			got, err := s.Expired(ctx, otherDay, ExpiryBucket(l.Key), later, nil, 1000)
 			if err != nil || len(got) != 0 {
 				t.Fatalf("Expired(before = expires_at) = %v, %v; want none", got, err)
 			}
 		}, key: l.Key, day: otherDay, want: true},
-		{name: "delete an entry", action: func(t *testing.T) {
-			if err := s.DeleteExpiry(ctx, day, expiryBucket(l.Key), cleanup.Entry{Key: l.Key, ExpiresAt: at}); err != nil {
-				t.Fatal(err)
-			}
-		}, key: l.Key, day: day, want: false},
 		{name: "delete a partition", action: func(t *testing.T) {
-			if err := s.DeleteExpiryPartition(ctx, otherDay, expiryBucket(l.Key)); err != nil {
+			if err := s.DeleteExpiryPartition(ctx, otherDay, ExpiryBucket(l.Key)); err != nil {
 				t.Fatal(err)
 			}
 		}, key: l.Key, day: otherDay, want: false},
@@ -90,6 +85,61 @@ func TestExpiryIndex(t *testing.T) {
 		if !ok {
 			break
 		}
+	}
+}
+
+// The cursor pages through a partition without gaps or repeats, including
+// entries that share an expires_at.
+func TestExpiredCursor(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	day := testDay()
+	at := day.Add(time.Hour)
+	// Keys in one bucket, three of them with the same expires_at.
+	var want []string
+	for i := 0; len(want) < 7; i++ {
+		key := uniqueKey()
+		if ExpiryBucket(key) != 7 {
+			continue
+		}
+		expiresAt := at.Add(time.Duration(len(want)/3) * time.Minute)
+		if err := s.indexExpiry(ctx, key, expiresAt); err != nil {
+			t.Fatal(err)
+		}
+		want = append(want, key)
+	}
+	tests := []struct {
+		name  string
+		limit int
+	}{
+		{name: "pages of 1", limit: 1},
+		{name: "pages of 2", limit: 2},
+		{name: "pages of 3, ties split across pages", limit: 3},
+		{name: "one page", limit: 100},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got []string
+			var after *cleanup.Entry
+			for {
+				page, err := s.Expired(ctx, day, 7, day.AddDate(0, 0, 1), after, tt.limit)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(page) == 0 {
+					break
+				}
+				for _, e := range page {
+					got = append(got, e.Key)
+				}
+				after = &page[len(page)-1]
+			}
+			slices.Sort(got)
+			sorted := slices.Sorted(slices.Values(want))
+			if !slices.Equal(got, sorted) {
+				t.Errorf("paged %d keys %v, want %d %v", len(got), got, len(sorted), sorted)
+			}
+		})
 	}
 }
 
@@ -111,6 +161,13 @@ func TestTombstone(t *testing.T) {
 			later := now().Add(time.Hour)
 			fresh.ExpiresAt = &later
 			if err := s.Update(ctx, fresh, link.Fields{ExpiresAt: true}); err != nil {
+				t.Fatal(err)
+			}
+		}, want: cleanup.Changed, wantListed: true},
+		{name: "URL changed since it was read", setup: func(t *testing.T, l *link.Link) {
+			changed := *l
+			changed.LongURL = "https://example.com/changed"
+			if err := s.Update(ctx, changed, link.Fields{LongURL: true}); err != nil {
 				t.Fatal(err)
 			}
 		}, want: cleanup.Changed, wantListed: true},

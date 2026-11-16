@@ -295,14 +295,27 @@ func (s *Store) warnRedis(msg, key string, err error) {
 	s.logger.Warn(msg, "key", key, "err", err)
 }
 
+// ttl is how long an entry stays in Redis. An expiring link's entry never
+// outlives its expires_at; an expired link that is not deleted yet will be
+// archived and tombstoned by the cleanup worker, which does not touch the
+// cache, so its entry is short-lived like a "not found" one.
 func (s *Store) ttl(e entry) time.Duration {
 	if !e.Found {
 		return s.cfg.NegativeTTL
 	}
-	if s.cfg.RedisTTLJitter <= 0 {
-		return s.cfg.RedisTTL
+	ttl := s.cfg.RedisTTL
+	if s.cfg.RedisTTLJitter > 0 {
+		ttl += rand.N(s.cfg.RedisTTLJitter)
 	}
-	return s.cfg.RedisTTL + rand.N(s.cfg.RedisTTLJitter)
+	if e.ExpiresAt == nil || e.DeletedAt != nil {
+		return ttl
+	}
+	left := time.Until(*e.ExpiresAt)
+	if left <= 0 {
+		return s.cfg.NegativeTTL
+	}
+	// Redis has millisecond expiry; zero would mean "never".
+	return max(min(ttl, left), time.Millisecond)
 }
 
 // Ping checks the Redis connection.

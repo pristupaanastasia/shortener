@@ -37,7 +37,7 @@ type TombstoneResult int
 const (
 	Tombstoned     TombstoneResult = iota // the link is now a tombstone
 	AlreadyDeleted                        // deleted before (by its owner or an earlier run)
-	Changed                               // expires_at changed since it was read: left as is
+	Changed                               // expires_at or long_url changed since it was read: left as is
 )
 
 // Store is the link storage as the worker needs it.
@@ -46,15 +46,14 @@ type Store interface {
 	// ExpiryBuckets is the number of index partitions per day.
 	ExpiryBuckets() int
 	// Expired returns up to limit index entries of a day and bucket that
-	// expire before the given time, earliest first.
-	Expired(ctx context.Context, day time.Time, bucket int, before time.Time, limit int) ([]Entry, error)
-	// DeleteExpiry removes an index entry.
-	DeleteExpiry(ctx context.Context, day time.Time, bucket int, e Entry) error
+	// expire before the given time, in order, starting after the given entry
+	// (from the start if nil).
+	Expired(ctx context.Context, day time.Time, bucket int, before time.Time, after *Entry, limit int) ([]Entry, error)
 	// DeleteExpiryPartition removes all index entries of a day and bucket.
 	DeleteExpiryPartition(ctx context.Context, day time.Time, bucket int) error
 	// Tombstone replaces the link with a tombstone (no URL, deleted_at set)
-	// unless its expires_at differs from l's, and removes it from its
-	// owner's listing.
+	// unless its expires_at or long_url differs from l's, and removes it
+	// from its owner's listing.
 	Tombstone(ctx context.Context, l link.Link, at time.Time) (TombstoneResult, error)
 	// Checkpoint returns the first day that is not fully cleaned up yet
 	// (ok is false before the first run); SetCheckpoint records it.
@@ -172,47 +171,50 @@ func (w *Worker) runDay(ctx context.Context, day, now time.Time, past bool) (Sta
 	return total, g.Wait()
 }
 
-// runBucket processes a partition batch by batch. Every entry it reads is
-// deleted from the index once handled, so the next read starts after it.
+// runBucket processes a partition batch by batch, each read starting after
+// the last entry of the previous one. Entries are not deleted one by one:
+// every deletion is a Cassandra tombstone that later reads of the partition
+// must scan (a read fails after 100K of them), and a past day's partition is
+// deleted as a whole anyway. Today's partition is read from its start again
+// by the next run; the links done already are skipped after one read each.
 func (w *Worker) runBucket(ctx context.Context, day time.Time, bucket int, now time.Time) (Stats, error) {
 	var s Stats
+	var after *Entry
 	for {
-		entries, err := w.store.Expired(ctx, day, bucket, now, w.cfg.BatchSize)
+		entries, err := w.store.Expired(ctx, day, bucket, now, after, w.cfg.BatchSize)
 		if err != nil || len(entries) == 0 {
 			return s, err
 		}
 		if err := w.runBatch(ctx, day, bucket, now, entries, &s); err != nil {
 			return s, err
 		}
+		after = &entries[len(entries)-1]
 	}
 }
 
 func (w *Worker) runBatch(ctx context.Context, day time.Time, bucket int, now time.Time, entries []Entry, s *Stats) error {
 	var expired []link.Link
-	var expiredEntries, done []Entry
 	for _, e := range entries {
 		l, err := w.store.Get(ctx, e.Key)
 		switch {
 		case errors.Is(err, link.ErrNotFound):
-			done = append(done, e)
+			s.Skipped++
 		case err != nil:
 			return err
 		case l.DeletedAt != nil:
-			// Deleted by its owner, or tombstoned by a run that stopped
-			// before dropping the entry. Tombstone again to make sure it
-			// left its owner's listing.
+			// Deleted by its owner, or tombstoned by an earlier run that
+			// may have stopped before removing it from its owner's listing:
+			// tombstone again to make sure it left.
 			if _, err := w.store.Tombstone(ctx, l, now); err != nil {
 				return err
 			}
-			done = append(done, e)
+			s.Skipped++
 		case l.ExpiresAt == nil || !l.ExpiresAt.Before(now):
-			done = append(done, e) // extended: its new expiry has its own entry
+			s.Skipped++ // extended: its new expiry has its own entry
 		default:
 			expired = append(expired, l)
-			expiredEntries = append(expiredEntries, e)
 		}
 	}
-	s.Skipped += len(done)
 
 	if len(expired) > 0 {
 		if err := w.archiveBatch(ctx, day, bucket, now, expired); err != nil {
@@ -227,14 +229,11 @@ func (w *Worker) runBatch(ctx context.Context, day time.Time, bucket int, now ti
 			if res == Tombstoned {
 				s.Archived++
 			} else {
-				s.Skipped++ // extended after it was read; the record is an extra
+				// Changed after it was read; the record is an extra one.
+				// If it is still expired (only its URL changed), the next
+				// run archives the current version.
+				s.Skipped++
 			}
-		}
-		done = append(done, expiredEntries...)
-	}
-	for _, e := range done {
-		if err := w.store.DeleteExpiry(ctx, day, bucket, e); err != nil {
-			return err
 		}
 	}
 	return nil

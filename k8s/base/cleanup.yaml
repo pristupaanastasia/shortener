@@ -19,7 +19,9 @@ spec:
     spec:
       # A failed run is retried; each run continues where the last stopped.
       backoffLimit: 3
-      activeDeadlineSeconds: 14400
+      # Most of the day, including retries: a day's expiries (up to 100M)
+      # then need ~1.4K links/s, see README "Flow 5".
+      activeDeadlineSeconds: 72000
       template:
         metadata:
           labels:

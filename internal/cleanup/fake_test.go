@@ -21,9 +21,11 @@ type fakeStore struct {
 	checkpoint *time.Time
 	listed     map[string]bool // keys in their owner's listing
 
-	failTombstone string // Tombstone of this key fails
-	extendOnRead  string // the link is extended right after it is read
-	tombstones    int
+	failTombstone   string // Tombstone of this key fails
+	extendOnRead    string // the link is extended right after it is read
+	changeURLOnRead string // the link's URL is changed right after it is read
+	tombstones      int
+	reads           int // Expired calls
 }
 
 func newFakeStore(buckets int) *fakeStore {
@@ -67,16 +69,28 @@ func (f *fakeStore) Get(_ context.Context, key string) (link.Link, error) {
 		later := l.ExpiresAt.Add(time.Hour)
 		f.links[key] = link.Link{Key: l.Key, LongURL: l.LongURL, UserID: l.UserID, CreatedAt: l.CreatedAt, ExpiresAt: &later}
 	}
+	if key == f.changeURLOnRead {
+		changed := l
+		changed.LongURL += "/changed"
+		f.links[key] = changed
+		f.changeURLOnRead = ""
+	}
 	return l, nil
 }
 
 func (f *fakeStore) ExpiryBuckets() int { return f.buckets }
 
-func (f *fakeStore) Expired(_ context.Context, day time.Time, bucket int, before time.Time, limit int) ([]Entry, error) {
+func (f *fakeStore) Expired(_ context.Context, day time.Time, bucket int, before time.Time, after *Entry, limit int) ([]Entry, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.reads++
+	entries := slices.Clone(f.index[partition(day, bucket)])
+	slices.SortFunc(entries, compareEntries)
 	var out []Entry
-	for _, e := range f.index[partition(day, bucket)] {
+	for _, e := range entries {
+		if after != nil && compareEntries(e, *after) <= 0 {
+			continue
+		}
 		if e.ExpiresAt.Before(before) && len(out) < limit {
 			out = append(out, e)
 		}
@@ -84,12 +98,12 @@ func (f *fakeStore) Expired(_ context.Context, day time.Time, bucket int, before
 	return out, nil
 }
 
-func (f *fakeStore) DeleteExpiry(_ context.Context, day time.Time, bucket int, e Entry) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	p := partition(day, bucket)
-	f.index[p] = slices.DeleteFunc(f.index[p], func(x Entry) bool { return x == e })
-	return nil
+// compareEntries orders entries like the clustering key (expires_at, key).
+func compareEntries(a, b Entry) int {
+	if c := a.ExpiresAt.Compare(b.ExpiresAt); c != 0 {
+		return c
+	}
+	return strings.Compare(a.Key, b.Key)
 }
 
 func (f *fakeStore) DeleteExpiryPartition(_ context.Context, day time.Time, bucket int) error {
@@ -107,7 +121,7 @@ func (f *fakeStore) Tombstone(_ context.Context, l link.Link, at time.Time) (Tom
 	}
 	cur := f.links[l.Key]
 	if cur.DeletedAt == nil {
-		if cur.ExpiresAt == nil || !cur.ExpiresAt.Equal(*l.ExpiresAt) {
+		if cur.ExpiresAt == nil || !cur.ExpiresAt.Equal(*l.ExpiresAt) || cur.LongURL != l.LongURL {
 			return Changed, nil
 		}
 		f.links[l.Key] = link.Link{Key: cur.Key, UserID: cur.UserID, CreatedAt: cur.CreatedAt, ExpiresAt: cur.ExpiresAt, DeletedAt: &at}

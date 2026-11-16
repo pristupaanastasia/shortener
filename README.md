@@ -82,8 +82,8 @@ The cleanup worker (`cmd/cleanup`) reads `CASSANDRA_HOSTS`, `CASSANDRA_KEYSPACE`
 | Level | Command | What it covers |
 |---|---|---|
 | Lint | `make lint` | `gofmt`, `go vet` (including integration-tagged files) |
-| Unit | `make test` | 96 test functions with the race detector; Redis via miniredis, stores in memory |
-| Integration | `make test-integration` | + 27 test functions against the `make up` stack: Cassandra LWTs and concurrent inserts, the cleanup worker with concurrent workers and no lease, S3, migrations on fresh databases, ClickHouse aggregates, the Kafka pipeline with a failing sink, real Redis |
+| Unit | `make test` | 97 test functions with the race detector; Redis via miniredis, stores in memory |
+| Integration | `make test-integration` | + 28 test functions against the `make up` stack: Cassandra LWTs and concurrent inserts, the cleanup worker with concurrent workers and no lease, S3, migrations on fresh databases, ClickHouse aggregates, the Kafka pipeline with a failing sink, real Redis |
 | Smoke | `make smoke`, `make smoke-full` | builds and starts the real binaries and walks through the user journey with curl (15 checks in memory, 22 on the full stack: register, create, redirect, patch, list, click statistics, delete, auth errors, archiving an expired link, metrics, clean shutdown) |
 | Coverage gate | `make coverage` | unit + integration tests and `smoke-full` (its binaries are built with `-cover`); fails below 80% |
 | Load | `make loadtest` | redirects and creates at once with vegeta; fails if redirect p99 ≥ 100 ms, create p99 ≥ 500 ms or success < 99%; see [Load Test Results](#load-test-results) |
@@ -97,7 +97,7 @@ Tests are table-driven (`.claude/skills/go-table-tests`); every database has mig
 
 | Check | Result |
 |---|---|
-| Unit + integration | 123 test functions, 490 cases, all passing |
+| Unit + integration | 125 test functions, 503 cases, all passing |
 | Coverage | 89.6% of statements (minimum 80%) |
 | Smoke | 15/15 in memory, 22/22 on the full stack, 14/14 against minikube |
 | Load | redirects: 30K/s with p99 1.2 ms; creates: 10K/s with p99 19.7 ms (after M7); 0 errors |
@@ -603,7 +603,7 @@ All services are **stateless**: state lives only in the storage layer, so servic
    - **hit** (most requests): go to step 4; **miss**: go to step 3.
 3. **Cassandra** `SELECT ... WHERE key = 'abc1234'` with consistency `QUORUM`. With `QUORUM` writes, `W + R > N` guarantees the read sees the latest write; with `ONE`, a miss could load a stale replica into the cache for an hour. Misses are a small fraction of traffic, so the extra cost is affordable.
    - Concurrent misses for the same key on one instance are collapsed into one Cassandra read (`singleflight`), which prevents a cache stampede when a hot key expires.
-   - The result is cached in Redis with `TTL = 1h + random(0, 10m)`. The jitter keeps entries that were cached together from expiring together (cache avalanche). Expired and deleted links are cached too: the service checks `expires_at`/`deleted_at` on every read, so 410 is served from cache.
+   - The result is cached in Redis with `TTL = 1h + random(0, 10m)`, but never past the link's `expires_at`; an expired link that the cleanup worker has not tombstoned yet is cached for 1 minute only, since the worker does not touch the cache. The jitter keeps entries that were cached together from expiring together (cache avalanche). Expired and deleted links are cached too: the service checks `expires_at`/`deleted_at` on every read, so 410 is served from cache.
    - **Negative caching:** a missing key is cached as "not found" for 1 minute. Otherwise a bot enumerating random keys would bypass the cache and flood Cassandra. Creating an alias drops its negative entry, so a new alias resolves immediately (other instances' L1 may serve 404 for up to 10s). For generated keys this Redis round trip is skipped (it was 8.6% of service CPU at 10K creates/s): a random key is practically never looked up before it exists, so the rare stale "not found" lasts at most the 1-minute negative TTL.
    - **Redis failures are treated as misses**, never as errors. The Redis client uses tight timeouts and minimal retries: with library defaults, an unavailable Redis added ~5 s to every request (measured in tests).
    - **Circuit breaker** (`internal/breaker`): after 5 consecutive Redis failures, every Redis call fails at once for 2 s, then one probe decides whether to close. A missing key and an error reply from the server count as answers, not failures. It is a go-redis hook shared by all Redis clients, so cache, rate limiter and idempotency skip Redis together. While it is open, nothing is logged per call, failed probes included: the opening and the recovery are logged once each, and `redis_circuit_state` (0 closed, 1 half-open, 2 open) shows the state.
@@ -680,13 +680,12 @@ The **Cleanup Worker** (`cmd/cleanup`, a daily Kubernetes `CronJob`) finds links
 
 **How a run works.** From the checkpoint (the first day not done) up to today, for each of the 256 buckets of a day, in parallel:
 
-1. Read up to 500 index entries with `expires_at < now`.
-2. Re-read each link from `links`. Skip it if it was extended, deleted or is missing; its index entry is dropped.
+1. Read up to 500 index entries with `expires_at < now`, starting after the last entry of the previous batch: `(expires_at, key) > (?, ?)`.
+2. Re-read each link from `links`. Skip it if it was extended, deleted or is missing.
 3. **Archive first:** the batch goes to one JSON Lines object, `expired/<day>/<bucket>/<first key>-<run time>.jsonl`.
-4. **Then tombstone:** `UPDATE links SET long_url = null, deleted_at = ? IF expires_at = <as read> AND deleted_at = null`, and remove the link from `links_by_user`. If the owner extended the link after step 2, the condition fails and the owner wins: the archive just holds an extra record.
-5. Drop the index entries, and read the next batch.
+4. **Then tombstone:** `UPDATE links SET long_url = null, deleted_at = ? IF expires_at = <as read> AND long_url = <as read> AND deleted_at = null`, and remove the link from `links_by_user`. If the owner extended the link or changed its URL after step 2, the condition fails and the owner wins: the archive just holds an extra record, and a still-expired link is archived with its new URL by the next run.
 
-A past day is complete (links cannot be created or extended into the past), so its partitions are deleted and the checkpoint moves past it. Today stays open, since links keep expiring until midnight.
+Index entries are **never deleted one by one**. Each deletion is a Cassandra tombstone, and a read scans every tombstone before its first live row: with deletions after each batch, reads of a partition got slower and failed after 100K deleted rows (`READ_TOO_MANY_TOMBSTONES`, the default threshold; found in review, at ~390K rows per partition the nightly run would have failed every time). A past day is complete (links cannot be created or extended into the past), so its partitions are deleted as a whole (one tombstone each) and the checkpoint moves past it. Today stays open, since links keep expiring until midnight: the next run reads today's partition from its start again and skips what is done (one read per link).
 
 **Failures.** Every step can be repeated, so a crashed run is simply run again:
 
@@ -695,7 +694,9 @@ A past day is complete (links cannot be created or extended into the past), so i
 
 **Several workers.** A lease in Cassandra (`INSERT ... IF NOT EXISTS USING TTL 300`, renewed every 100 s) lets one run at a time do the work; a crashed holder blocks the next run for at most 5 minutes. The lease only saves work, **correctness does not depend on it**: every tombstone is a lightweight transaction. Verified by an integration test with four workers and no lease: each of 40 links was tombstoned exactly once (without `deleted_at = null` in the condition, the same test counted 130 tombstones).
 
-**Throughput.** At 100M expiring links per day the worker needs ~1.2K links/s: 16 buckets in parallel, each doing a read and an LWT per link and one archive object per 500 links.
+**Throughput.** The run starts daily at 03:00 and may take up to 20 h (the Job's `activeDeadlineSeconds`, retries included), so a day of 100M expiring links needs **~1.4K links/s**, plus re-reading the part of the day done at 03:00 of the day before. Per link it is a read and an LWT, plus one archive object per 500 links. Measured locally (one Cassandra node, RF 1, 16 buckets in parallel): 5,000 links in 0.88 s, **~5.7K links/s**. LWTs at RF 3 with QUORUM are slower; production throughput is untested here, and `Parallel` is the knob.
+
+**Not covered:** links created before the expiry index existed (migration 0003) have no index entries and are never archived; they would need a one-off backfill that scans `links`. Soft-deleted links that never expire keep their URL.
 
 ### Consistency Between Stores (Dual Writes)
 
