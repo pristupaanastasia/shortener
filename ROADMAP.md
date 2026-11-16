@@ -68,3 +68,13 @@ Each milestone produces a working service. Work in order; the user reviews each 
 - [x] Report: measured throughput and p99 latency, the first bottleneck found and how it was addressed
 
 **Done when:** the load test runs with one command and the report is added to `README.md` ("Load Test Results").
+
+## M7: Write-Path Optimizations
+
+The first bottleneck in the code found by the M6 load test: two Redis round trips per create. Baseline at 10K creates/s: rate limiter 12.8% of service CPU, negative-cache `DEL` 8.6%, Cassandra LWT 4.0%; 1.54 cores, create p99 34 ms.
+
+- [ ] Skip the negative-cache `DEL` on create for generated keys (a random key is practically never looked up before it exists; aliases still drop their negative entry)
+- [ ] Approximate rate limiting: count in memory and flush increments to Redis in batches (`RATE_LIMIT_SYNC_INTERVAL`; 0 keeps the exact per-request limiter); document the over-admission bound
+- [ ] Measure again with the same load and update the "Load Test Results" section in `README.md`
+
+**Done when:** `make check`, `make coverage` and `make loadtest` pass; the CPU profile at 10K creates/s shows the rate limiter and the `DEL` reduced, with before/after numbers in `README.md`.

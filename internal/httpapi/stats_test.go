@@ -97,7 +97,7 @@ func TestRedirectPublishesClicks(t *testing.T) {
 				{Key: "abc1234", LongURL: "https://example.com"},
 				{Key: "expired", LongURL: "https://example.com", ExpiresAt: &past},
 			} {
-				if err := store.Create(context.Background(), l); err != nil {
+				if err := store.Create(context.Background(), l, link.CreateOptions{}); err != nil {
 					t.Fatal(err)
 				}
 			}

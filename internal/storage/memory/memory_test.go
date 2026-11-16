@@ -27,7 +27,7 @@ func TestStore(t *testing.T) {
 			}
 		}},
 		{name: "create", run: func(t *testing.T) {
-			if err := s.Create(ctx, link.Link{Key: "abc1234", LongURL: "https://example.com"}); err != nil {
+			if err := s.Create(ctx, link.Link{Key: "abc1234", LongURL: "https://example.com"}, link.CreateOptions{}); err != nil {
 				t.Fatalf("Create: %v", err)
 			}
 		}},
@@ -38,7 +38,7 @@ func TestStore(t *testing.T) {
 			}
 		}},
 		{name: "duplicate keeps original", run: func(t *testing.T) {
-			if err := s.Create(ctx, link.Link{Key: "abc1234", LongURL: "https://other.com"}); !errors.Is(err, link.ErrKeyTaken) {
+			if err := s.Create(ctx, link.Link{Key: "abc1234", LongURL: "https://other.com"}, link.CreateOptions{}); !errors.Is(err, link.ErrKeyTaken) {
 				t.Fatalf("Create duplicate err = %v, want ErrKeyTaken", err)
 			}
 			if got, _ := s.Get(ctx, "abc1234"); got.LongURL != "https://example.com" {
@@ -110,7 +110,7 @@ func TestCreateConcurrentSameKey(t *testing.T) {
 			var created atomic.Int32
 			for range tt.goroutines {
 				wg.Go(func() {
-					if err := s.Create(context.Background(), link.Link{Key: "same123"}); err == nil {
+					if err := s.Create(context.Background(), link.Link{Key: "same123"}, link.CreateOptions{}); err == nil {
 						created.Add(1)
 					}
 				})
@@ -137,7 +137,7 @@ func TestListByUser(t *testing.T) {
 		{Key: "gone", UserID: "alice", CreatedAt: base.Add(4 * time.Second), DeletedAt: &deleted},
 		{Key: "b1", UserID: "bob", CreatedAt: base.Add(5 * time.Second)},
 	} {
-		if err := s.Create(ctx, l); err != nil {
+		if err := s.Create(ctx, l, link.CreateOptions{}); err != nil {
 			t.Fatal(err)
 		}
 	}

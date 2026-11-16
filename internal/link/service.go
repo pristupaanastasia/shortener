@@ -71,7 +71,7 @@ func (s *Service) Create(ctx context.Context, p CreateParams) (Link, error) {
 			return Link{}, err
 		}
 		l.Key = p.Alias
-		err := s.store.Create(ctx, l)
+		err := s.store.Create(ctx, l, CreateOptions{GeneratedKey: false})
 		if errors.Is(err, ErrKeyTaken) {
 			return Link{}, fmt.Errorf("%w: %q", ErrAliasTaken, p.Alias)
 		}
@@ -83,7 +83,7 @@ func (s *Service) Create(ctx context.Context, p CreateParams) (Link, error) {
 
 	for attempt := range maxKeyAttempts {
 		l.Key = s.generate(p.LongURL, attempt)
-		err := s.store.Create(ctx, l)
+		err := s.store.Create(ctx, l, CreateOptions{GeneratedKey: true})
 		if errors.Is(err, ErrKeyTaken) {
 			continue
 		}

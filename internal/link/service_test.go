@@ -13,7 +13,7 @@ import (
 // mapStore is a minimal Store for service tests.
 type mapStore map[string]Link
 
-func (m mapStore) Create(_ context.Context, l Link) error {
+func (m mapStore) Create(_ context.Context, l Link, _ CreateOptions) error {
 	if _, ok := m[l.Key]; ok {
 		return ErrKeyTaken
 	}
@@ -363,10 +363,10 @@ type lockedStore struct {
 	m  mapStore
 }
 
-func (s *lockedStore) Create(ctx context.Context, l Link) error {
+func (s *lockedStore) Create(ctx context.Context, l Link, opts CreateOptions) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.m.Create(ctx, l)
+	return s.m.Create(ctx, l, opts)
 }
 
 func (s *lockedStore) Get(ctx context.Context, key string) (Link, error) {

@@ -40,6 +40,15 @@ func (l Link) Active(now time.Time) bool {
 	return l.ExpiresAt == nil || now.Before(*l.ExpiresAt)
 }
 
+// CreateOptions describe how a link's key was chosen; stores that only
+// persist links ignore them.
+type CreateOptions struct {
+	// GeneratedKey is true for a random key, false for a user's alias. A
+	// cache uses it to skip dropping a "not found" entry: nobody looks up a
+	// random key before it exists, while an alias may have been tried.
+	GeneratedKey bool
+}
+
 // Fields selects the columns Store.Update writes.
 type Fields struct {
 	LongURL   bool
@@ -50,7 +59,7 @@ type Fields struct {
 type Store interface {
 	// Create inserts the link if no link with the same key exists,
 	// and returns ErrKeyTaken otherwise. The check and insert are atomic.
-	Create(ctx context.Context, l Link) error
+	Create(ctx context.Context, l Link, opts CreateOptions) error
 	// Get returns the link with the given key, or ErrNotFound.
 	Get(ctx context.Context, key string) (Link, error)
 	// Update writes the fields selected by f from l to an existing, not

@@ -43,7 +43,7 @@ func newTestCache(t *testing.T, cfg Config) (*Store, *countingStore, *miniredis.
 
 func mustCreate(t *testing.T, s link.Store, l link.Link) {
 	t.Helper()
-	if err := s.Create(context.Background(), l); err != nil {
+	if err := s.Create(context.Background(), l, link.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -273,7 +273,7 @@ func TestRedisDown(t *testing.T) {
 			return err
 		}},
 		{name: "create still works", action: func(c *Store) error {
-			return c.Create(context.Background(), link.Link{Key: "new1234", LongURL: "https://example.com/new"})
+			return c.Create(context.Background(), link.Link{Key: "new1234", LongURL: "https://example.com/new"}, link.CreateOptions{})
 		}},
 		{name: "update still works", action: func(c *Store) error {
 			return c.Update(context.Background(), link.Link{Key: "abc1234", LongURL: "https://example.com/new"}, link.Fields{LongURL: true})
@@ -377,4 +377,47 @@ type failingStore struct{ link.Store }
 
 func (failingStore) Get(context.Context, string) (link.Link, error) {
 	return link.Link{}, errors.New("cassandra unavailable")
+}
+
+// A generated key skips the Redis round trip on create; an alias still drops
+// its negative entry there.
+//
+// The trade-off, pinned down here: if a generated key was looked up before it
+// existed, its "not found" entry stays in Redis until the negative TTL (1 min)
+// expires. That needs someone to guess a random 7-character key in advance,
+// so it is accepted; an alias, which people do try before creating it, is
+// served at once.
+func TestCreateDropsNegativeEntries(t *testing.T) {
+	tests := []struct {
+		name          string
+		opts          link.CreateOptions
+		wantRedisCmds int  // commands sent to Redis by Create itself
+		wantFound     bool // whether a lookup right after Create finds the link
+	}{
+		{name: "alias drops the redis entry", opts: link.CreateOptions{GeneratedKey: false}, wantRedisCmds: 1, wantFound: true},
+		{name: "generated key skips redis", opts: link.CreateOptions{GeneratedKey: true}, wantRedisCmds: 0, wantFound: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, _, mr := newTestCache(t, DefaultConfig())
+			ctx := context.Background()
+			if _, err := c.Get(ctx, "abc1234"); !errors.Is(err, link.ErrNotFound) {
+				t.Fatalf("Get before create: err = %v, want ErrNotFound", err)
+			}
+			before := mr.CommandCount()
+			if err := c.Create(ctx, link.Link{Key: "abc1234", LongURL: "https://example.com"}, tt.opts); err != nil {
+				t.Fatal(err)
+			}
+			if got := mr.CommandCount() - before; got != tt.wantRedisCmds {
+				t.Errorf("Redis commands during Create = %d, want %d", got, tt.wantRedisCmds)
+			}
+			if _, ok := c.l1.Get("abc1234"); ok {
+				t.Error("negative entry still in L1 after create")
+			}
+			_, err := c.Get(ctx, "abc1234")
+			if found := err == nil; found != tt.wantFound {
+				t.Errorf("Get after create: err = %v, want found %v", err, tt.wantFound)
+			}
+		})
+	}
 }
