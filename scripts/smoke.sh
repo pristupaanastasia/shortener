@@ -4,15 +4,25 @@
 # usual environment variables (STORAGE, REDIS_ADDR, POSTGRES_DSN, ...); with
 # none set, everything runs in memory. With KAFKA_BROKERS and CLICKHOUSE_DSN
 # set, the analytics consumer runs too and click statistics are checked.
+#
+# With SMOKE_URL set, nothing is built or started: the journey runs against
+# that already running service (e.g. a port-forward into Kubernetes), and the
+# shutdown checks are skipped. SMOKE_ANALYTICS=1 checks click statistics and
+# SMOKE_METRICS_URL the metrics endpoint in that mode.
 set -euo pipefail
 
 port="${SMOKE_PORT:-18181}"
-base="http://127.0.0.1:$port"
+base="${SMOKE_URL:-http://127.0.0.1:$port}"
+metrics_url="${SMOKE_METRICS_URL:-http://127.0.0.1:${SMOKE_METRICS_PORT:-$((port + 1))}}"
 work="$(mktemp -d)"
 log="$work/server.log"
+external=false
+[ -n "${SMOKE_URL:-}" ] && external=true
 
 analytics=false
-if [ -n "${KAFKA_BROKERS:-}" ] && [ -n "${CLICKHOUSE_DSN:-}" ]; then
+if $external; then
+	[ -n "${SMOKE_ANALYTICS:-}" ] && analytics=true
+elif [ -n "${KAFKA_BROKERS:-}" ] && [ -n "${CLICKHOUSE_DSN:-}" ]; then
 	analytics=true
 	# A topic of its own: the shared one may hold millions of events (e.g.
 	# after a load test), and concurrent runs must not see each other's clicks.
@@ -28,22 +38,24 @@ if [ -n "${SMOKE_COVERDIR:-}" ]; then
 	export GOCOVERDIR="$SMOKE_COVERDIR"
 fi
 
-"${build[@]}" -o "$work/shortener" ./cmd/shortener
-# Several smoke runs per minute from 127.0.0.1 (the pre-push hook, CI,
-# concurrent runs) would exceed the default anonymous limit of 10/min.
-metrics_port="${SMOKE_METRICS_PORT:-$((port + 1))}"
-RATE_LIMIT_ANONYMOUS=1000 METRICS_ADDR="127.0.0.1:$metrics_port" ADDR=":$port" BASE_URL="$base" "$work/shortener" >"$log" 2>&1 &
-pid=$!
+pid=""
 consumer_pid=""
-if $analytics; then
-	"${build[@]}" -o "$work/consumer" ./cmd/consumer
-	KAFKA_GROUP=smoke FLUSH_INTERVAL=200ms "$work/consumer" >"$work/consumer.log" 2>&1 &
-	consumer_pid=$!
+if ! $external; then
+	"${build[@]}" -o "$work/shortener" ./cmd/shortener
+	# Several smoke runs per minute from 127.0.0.1 (the pre-push hook, CI,
+	# concurrent runs) would exceed the default anonymous limit of 10/min.
+	RATE_LIMIT_ANONYMOUS=1000 METRICS_ADDR="${metrics_url#http://}" ADDR=":$port" BASE_URL="$base" "$work/shortener" >"$log" 2>&1 &
+	pid=$!
+	if $analytics; then
+		"${build[@]}" -o "$work/consumer" ./cmd/consumer
+		KAFKA_GROUP=smoke FLUSH_INTERVAL=200ms "$work/consumer" >"$work/consumer.log" 2>&1 &
+		consumer_pid=$!
+	fi
 fi
 # Delete the per-run topic too, so smoke runs do not pile up topics.
 cleanup() {
-	kill "$pid" $consumer_pid 2>/dev/null || true
-	if $analytics; then
+	[ -n "$pid" ] && kill "$pid" $consumer_pid 2>/dev/null || true
+	if $analytics && ! $external; then
 		go run ./scripts/deltopics -brokers "$KAFKA_BROKERS" "$KAFKA_TOPIC" >/dev/null 2>&1 || true
 	fi
 	rm -rf "$work"
@@ -52,8 +64,10 @@ trap cleanup EXIT
 
 fail() {
 	echo "smoke: FAIL: $*"
-	echo "--- server log"
-	cat "$log"
+	if [ -f "$log" ]; then
+		echo "--- server log"
+		cat "$log"
+	fi
 	if [ -f "$work/consumer.log" ]; then
 		echo "--- consumer log"
 		cat "$work/consumer.log"
@@ -69,7 +83,7 @@ expect() {
 
 for _ in $(seq 1 60); do
 	curl -sf "$base/healthz" >/dev/null 2>&1 && break
-	kill -0 "$pid" 2>/dev/null || fail "server exited during startup"
+	[ -z "$pid" ] || kill -0 "$pid" 2>/dev/null || fail "server exited during startup"
 	sleep 0.5
 done
 curl -sf "$base/healthz" >/dev/null || fail "server is not healthy after 30s"
@@ -111,9 +125,14 @@ expect "list without key" 401 "$(status "$base/api/v1/links")"
 expect "delete link" 204 "$(status -X DELETE "$base/api/v1/links/$alias" "${auth[@]}")"
 expect "redirect after delete" 410 "$(status "$base/$alias")"
 expect "unknown key" 404 "$(status "$base/nosuchkey$run")"
-redirects="$(curl -s "http://127.0.0.1:$metrics_port/metrics" | grep -c '^http_requests_total{code="301",method="GET",route="GET /{key}"}' || true)"
-expect "metrics count redirects by route pattern" 1 "$redirects"
+if ! $external || [ -n "${SMOKE_METRICS_URL:-}" ]; then
+	redirects="$(curl -s "$metrics_url/metrics" | grep -c '^http_requests_total{code="301",method="GET",route="GET /{key}"}' || true)"
+	expect "metrics count redirects by route pattern" 1 "$redirects"
+fi
 
+if $external; then
+	exit 0 # the service is not ours to stop
+fi
 kill -INT "$pid"
 code=0
 wait "$pid" || code=$?

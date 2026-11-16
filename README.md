@@ -685,3 +685,35 @@ The latency requirements (redirect p99 < 100 ms, create p99 < 500 ms) and the > 
    | Create latency, mean / p99 | 6.5 / 34.1 ms | 3.1 / 19.7 ms |
    | Redirect p99 | 8.6 ms | 7.2 ms |
 3. **Next infrastructure limit: the single Cassandra node** at ~3.9 cores for 10K creates/s (Paxos for every LWT). In production, writes spread over a multi-node cluster.
+
+## Deployment (Kubernetes)
+
+Manifests are in `k8s/` (kustomize). `k8s/base` describes the service in any cluster; overlays adapt it to an environment.
+
+| Object | Purpose |
+|---|---|
+| `Deployment/shortener` | the API and redirects; 3 replicas, `maxUnavailable: 0` so rollouts never drop below capacity |
+| `Service/shortener` | port 80 → 8080 for traffic, 9091 for Prometheus (`/metrics`, `/debug/pprof`; the pod network is isolated, so the metrics server listens on all pod interfaces) |
+| `HorizontalPodAutoscaler/shortener` | 3–20 replicas at 70% CPU: the load test measured ~23K redirects/s per core |
+| `PodDisruptionBudget/shortener` | node drains take at most one pod at a time |
+| `Deployment/consumer` | the analytics consumer; replicas up to the number of partitions of the clicks topic |
+| `ConfigMap` / `Secret` | addresses of the dependencies; credentials (PostgreSQL and ClickHouse DSNs) |
+
+**Pod design:**
+
+- The image is distroless and runs as UID 65532 with a read-only root filesystem and all capabilities dropped (55 MB, both binaries). A numeric UID is required for `runAsNonRoot` to be verifiable.
+- Probes: a startup probe covers connecting to the databases and applying migrations; readiness and liveness use `/healthz`.
+- **Graceful shutdown:** `preStop: sleep 5s` keeps the pod serving while it is removed from the Service's endpoints; only then does it get SIGTERM and drain in-flight requests (10 s). Verified with `make k8s-rollout`: a rolling restart under 200 requests/s from inside the cluster loses no requests (9000 of 9000 succeeded); without the `preStop` pause, the same check failed a request.
+
+**Local cluster:** a minikube profile `shortener` runs `k8s/overlays/local`; the dependencies stay in `make up` on the host and are reached via `host.minikube.internal` (Kafka has a second listener advertised under that name, since its default one advertises `localhost`). Every `kubectl` call in `scripts/k8s.sh` passes `--context shortener`, never relying on the current context.
+
+```
+make up                  # dependencies
+make k8s-up              # minikube profile "shortener"
+make k8s-deploy          # build and load the image, apply, wait for the rollout
+make k8s-smoke           # the smoke test through a port-forward, including click statistics
+make k8s-rollout         # rolling restart under load, no failed requests allowed
+make k8s-down            # delete the namespace; k8s-destroy deletes the profile
+```
+
+Not covered: running the dependencies themselves in Kubernetes (stateful sets or managed services), an Ingress, and NetworkPolicies restricting the metrics port to the monitoring namespace.

@@ -1,4 +1,4 @@
-.PHONY: build run test test-integration coverage smoke smoke-full loadtest lint check up down hooks
+.PHONY: build run test test-integration coverage smoke smoke-full loadtest lint check up down hooks k8s-up k8s-deploy k8s-smoke k8s-rollout k8s-down k8s-destroy
 
 build:
 	go build -o bin/shortener ./cmd/shortener
@@ -54,3 +54,23 @@ down:
 # Use the versioned git hooks from .githooks (pre-push: lint + tests).
 hooks:
 	git config core.hooksPath .githooks
+
+# Local Kubernetes (minikube profile "shortener"); the dependencies come from
+# `make up`. See scripts/k8s.sh.
+k8s-up:
+	./scripts/k8s.sh up
+
+k8s-deploy:
+	./scripts/k8s.sh deploy
+
+k8s-smoke:
+	./scripts/k8s.sh smoke
+
+k8s-rollout:
+	./scripts/k8s.sh rollout
+
+k8s-down:
+	./scripts/k8s.sh down
+
+k8s-destroy:
+	./scripts/k8s.sh destroy
