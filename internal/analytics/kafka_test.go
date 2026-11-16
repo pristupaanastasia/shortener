@@ -56,12 +56,30 @@ func (s *memorySink) count(key string) int {
 	return n
 }
 
-// newTopic returns a name for a topic of its own: tests must not depend on
-// the history of the shared topic, which may hold millions of events (e.g.
-// after a load test) that a new consumer group would read from the start.
-// The topic is created on first use.
-func newTopic() string {
-	return "it-" + strings.ToLower(rand.Text())[:12]
+// newTopic creates a topic of its own for a test and waits until it accepts
+// writes. Tests must not depend on the history of the shared topic, which may
+// hold millions of events (e.g. after a load test) that a new consumer group
+// would read from the start.
+//
+// Creation is explicit: if the publisher under test created the topic on its
+// first write, leader election under a loaded machine could outlast its
+// 5-second close timeout and drop events. The record written here is not
+// valid JSON, so every consumer test also checks that a malformed event is
+// skipped instead of blocking the partition.
+func newTopic(t *testing.T) string {
+	t.Helper()
+	topic := "it-" + strings.ToLower(rand.Text())[:12]
+	client, err := kgo.NewClient(kgo.SeedBrokers(brokers()...), kgo.DefaultProduceTopic(topic), kgo.AllowAutoTopicCreation())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := client.ProduceSync(ctx, &kgo.Record{Key: []byte("malformed"), Value: []byte("not json")}).FirstErr(); err != nil {
+		t.Fatalf("create topic %s: %v", topic, err)
+	}
+	return topic
 }
 
 // consume runs a consumer of topic in group until stop is called; stop
@@ -116,7 +134,7 @@ func TestStopDuringRetryKeepsEvents(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			key := "it" + strings.ToLower(rand.Text())[:10]
-			topic, group := newTopic(), "it-"+key
+			topic, group := newTopic(t), "it-"+key
 			publish(t, topic, key, tt.events)
 
 			down := &memorySink{failures: 1 << 30} // ClickHouse is down
@@ -168,18 +186,9 @@ func TestKafkaPipeline(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel() // each case has its own topic, key and consumer group
 			key := "it" + strings.ToLower(rand.Text())[:10]
-			topic, group := newTopic(), "it-"+key
+			topic, group := newTopic(t), "it-"+key
 
-			publish(t, topic, key, tt.events)
-			// A malformed record must be skipped, not block the partition.
-			raw, err := kgo.NewClient(kgo.SeedBrokers(brokers()...), kgo.DefaultProduceTopic(topic))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := raw.ProduceSync(context.Background(), &kgo.Record{Key: []byte(key), Value: []byte("not json")}).FirstErr(); err != nil {
-				t.Fatal(err)
-			}
-			raw.Close()
+			publish(t, topic, key, tt.events) // after newTopic's malformed record
 
 			sink := &memorySink{failures: tt.sinkFailures}
 			stop := consume(t, topic, group, sink)
