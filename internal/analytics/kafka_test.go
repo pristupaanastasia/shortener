@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -79,6 +80,20 @@ func newTopic(t *testing.T) string {
 	if err := client.ProduceSync(ctx, &kgo.Record{Key: []byte("malformed"), Value: []byte("not json")}).FirstErr(); err != nil {
 		t.Fatalf("create topic %s: %v", topic, err)
 	}
+	// Remove the topic afterwards, so per-test topics do not pile up on the
+	// shared development broker.
+	t.Cleanup(func() {
+		admin, err := kgo.NewClient(kgo.SeedBrokers(brokers()...))
+		if err != nil {
+			return
+		}
+		defer admin.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, err := kadm.NewClient(admin).DeleteTopics(ctx, topic); err != nil {
+			t.Logf("delete topic %s: %v", topic, err)
+		}
+	})
 	return topic
 }
 

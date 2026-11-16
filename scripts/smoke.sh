@@ -32,7 +32,7 @@ fi
 # Several smoke runs per minute from 127.0.0.1 (the pre-push hook, CI,
 # concurrent runs) would exceed the default anonymous limit of 10/min.
 metrics_port="${SMOKE_METRICS_PORT:-$((port + 1))}"
-RATE_LIMIT_ANONYMOUS=1000 METRICS_ADDR=":$metrics_port" ADDR=":$port" BASE_URL="$base" "$work/shortener" >"$log" 2>&1 &
+RATE_LIMIT_ANONYMOUS=1000 METRICS_ADDR="127.0.0.1:$metrics_port" ADDR=":$port" BASE_URL="$base" "$work/shortener" >"$log" 2>&1 &
 pid=$!
 consumer_pid=""
 if $analytics; then
@@ -40,7 +40,15 @@ if $analytics; then
 	KAFKA_GROUP=smoke FLUSH_INTERVAL=200ms "$work/consumer" >"$work/consumer.log" 2>&1 &
 	consumer_pid=$!
 fi
-trap 'kill "$pid" $consumer_pid 2>/dev/null || true; rm -rf "$work"' EXIT
+# Delete the per-run topic too, so smoke runs do not pile up topics.
+cleanup() {
+	kill "$pid" $consumer_pid 2>/dev/null || true
+	if $analytics; then
+		go run ./scripts/deltopics -brokers "$KAFKA_BROKERS" "$KAFKA_TOPIC" >/dev/null 2>&1 || true
+	fi
+	rm -rf "$work"
+}
+trap cleanup EXIT
 
 fail() {
 	echo "smoke: FAIL: $*"
@@ -119,7 +127,8 @@ if $analytics; then
 		fail "errors in the consumer log"
 	fi
 fi
-trap 'rm -rf "$work"' EXIT
+pid=""
+consumer_pid=""
 grep -q '"msg":"shutting down"' "$log" || fail "no shutdown message in the log"
 if grep -q '"level":"ERROR"' "$log"; then
 	fail "errors in the server log"

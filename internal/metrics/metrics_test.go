@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -83,6 +84,57 @@ func TestHandler(t *testing.T) {
 			body, _ := io.ReadAll(rec.Body)
 			if !strings.Contains(string(body), tt.wantLine) {
 				t.Errorf("metrics output has no %q", tt.wantLine)
+			}
+		})
+	}
+}
+
+// Regression: the raw method was a label, so arbitrary methods created
+// unlimited time series.
+func TestMethodCardinality(t *testing.T) {
+	tests := []struct {
+		name       string
+		methods    int
+		wantSeries int
+	}{
+		{name: "500 made-up methods share one series", methods: 500, wantSeries: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := New()
+			srv := httptest.NewServer(m.Middleware(newTestMux()))
+			defer srv.Close()
+			for i := range tt.methods {
+				req, err := http.NewRequest("M"+strconv.Itoa(i)+"X", srv.URL+"/a/b", nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				resp, err := srv.Client().Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_ = resp.Body.Close()
+			}
+			if got := testutil.CollectAndCount(m.requests); got != tt.wantSeries {
+				t.Errorf("http_requests_total has %d series, want %d", got, tt.wantSeries)
+			}
+		})
+	}
+}
+
+func TestMethodLabel(t *testing.T) {
+	tests := []struct {
+		name, method, want string
+	}{
+		{name: "get", method: "GET", want: "GET"},
+		{name: "patch", method: "PATCH", want: "PATCH"},
+		{name: "lowercase is not normalized", method: "get", want: "other"},
+		{name: "made up", method: "M1X", want: "other"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := methodLabel(tt.method); got != tt.want {
+				t.Errorf("methodLabel(%q) = %q, want %q", tt.method, got, tt.want)
 			}
 		})
 	}

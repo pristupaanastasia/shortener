@@ -641,7 +641,7 @@ Aliases and generated keys share one namespace. A user may pick `hello12`, which
 
 ## Load Test Results
 
-Measured with `make loadtest` (vegeta, run natively) and ad-hoc vegeta runs, plus CPU profiles from `/debug/pprof` on the metrics port.
+Measured with `make loadtest` (vegeta, run natively) and ad-hoc vegeta runs, plus CPU profiles from `/debug/pprof` on the metrics port. Service CPU is in cores (1.0 = one core); `make loadtest` derives it from the service's `process_cpu_seconds_total` over the load window.
 
 **Test bed:** one MacBook (12 cores), everything on the same machine: the service, the load generator, and single-node Cassandra, Redis, PostgreSQL, Kafka and ClickHouse in Docker Desktop. Absolute numbers are a lower bound for production hardware; the useful results are the ratios and where time goes. Redirects use 1000 links with 80% of traffic on 20% of them (the 80/20 assumption); creates run at the same time.
 
@@ -655,7 +655,7 @@ Measured with `make loadtest` (vegeta, run natively) and ad-hoc vegeta runs, plu
 | vegeta, native | 30K/s | 30K/s | 53 µs | 1.2 ms | 100% | 1.2 cores |
 | vegeta, native | 50K/s | 49.2K/s | 7.7 ms | 70 ms | 98.5% | 2.2 cores (max 4.4) |
 
-- L1 answered 95–99% of lookups, Redis ~1–3%, Cassandra only the first miss of each link (`cache_lookups_total`).
+- L1 answered 95–99% of lookups, Redis ~1–3%, and Cassandra was read about once per link (`cache_lookups_total{level="store"}`); concurrent misses of the same link share that read (`level="coalesced"`).
 - At 30K/s, **our code is under 2% of the service's CPU** (redirect handler 0.6%, metrics middleware 1%); ~95% is socket syscalls and the Go scheduler waking goroutines on network events: the fixed cost of an HTTP request. Publishing clicks to Kafka does not show up in the profile (batched).
 - That is ~23K redirects/s per core. The design load of 100K redirects/s (300K peak) needs about 5 cores (15 at peak) of redirect service, before headroom.
 
@@ -668,7 +668,7 @@ Measured with `make loadtest` (vegeta, run natively) and ad-hoc vegeta runs, plu
 | 6K/s | 6K/s | 3.1 ms | 36 ms | 100% | 1.2 cores | 3.1 cores |
 | 10K/s | 10K/s | 4.8 ms | 59 ms | 100% | 1.5 cores | 3.9 cores |
 
-The requirements (redirect p99 < 100 ms, create p99 < 500 ms) are met at every measured load, with a wide margin at the design load.
+The latency requirements (redirect p99 < 100 ms, create p99 < 500 ms) and the > 99% success gate of `make loadtest` are met up to 30K redirects/s and 10K creates/s, with a wide margin at the design load. The 50K redirects/s run does **not** pass: 98.5% success, because the load generator ran out of ephemeral ports on the client side (see below); it shows the limit of a single-machine test bed, not of the service.
 
 ### Bottlenecks
 

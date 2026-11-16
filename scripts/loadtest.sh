@@ -13,16 +13,38 @@
 set -euo pipefail
 
 redirect_rate="${REDIRECT_RATE:-10000}"
+if [ -n "${PROFILE:-}" ] && [[ "${DURATION:-20s}" =~ ^([0-9]+)s$ ]] && [ "${BASH_REMATCH[1]}" -lt 13 ]; then
+	echo "loadtest: PROFILE needs DURATION of at least 13s (the profile covers 10s, starting 3s in)" >&2
+	exit 2
+fi
 create_rate="${CREATE_RATE:-1000}"
 duration="${DURATION:-20s}"
 links="${LINKS:-1000}"
 port="${LOADTEST_PORT:-18700}"
 metrics_port=$((port + 1))
 base="http://127.0.0.1:$port"
-vegeta=(go run github.com/tsenart/vegeta/v12@v12.13.0)
 
 work="$(mktemp -d)"
-"${vegeta[@]}" -version >/dev/null # download and build once, before timing anything
+topic="loadtest-$(date +%s)$RANDOM"
+pid="" r="" c="" profiler=""
+# On any exit (including SIGTERM from make or CI), stop the load generators
+# and the profiler before the service, wait for the service, and delete the
+# per-run topic, which may hold millions of click events.
+cleanup() {
+	kill $r $c $profiler 2>/dev/null || true
+	if [ -n "$pid" ]; then
+		kill -INT "$pid" 2>/dev/null || true
+		wait "$pid" 2>/dev/null || true
+	fi
+	go run ./scripts/deltopics "$topic" >/dev/null 2>&1 || true
+	rm -rf "$work"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+# A real binary, not `go run`: go run does not pass signals on, so stopping it
+# would leave vegeta sending load.
+GOBIN="$work" go install github.com/tsenart/vegeta/v12@v12.13.0
+vegeta="$work/vegeta"
 go build -o "$work/shortener" ./cmd/shortener
 
 # Rate limits are raised: the load generator is a single client. Clicks go to
@@ -30,12 +52,11 @@ go build -o "$work/shortener" ./cmd/shortener
 # shared topic that consumers and tests read.
 STORAGE=cassandra REDIS_ADDR=127.0.0.1:6379 \
 POSTGRES_DSN="postgres://shortener:shortener@127.0.0.1:5432/shortener?sslmode=disable" \
-KAFKA_BROKERS=127.0.0.1:9092 KAFKA_TOPIC="loadtest-$(date +%s)" \
+KAFKA_BROKERS=127.0.0.1:9092 KAFKA_TOPIC="$topic" \
 RATE_LIMIT_ANONYMOUS=100000000 RATE_LIMIT_USER=100000000 \
-ADDR=":$port" METRICS_ADDR=":$metrics_port" BASE_URL="$base" \
+ADDR=":$port" METRICS_ADDR="127.0.0.1:$metrics_port" BASE_URL="$base" \
 	"$work/shortener" >"$work/server.log" 2>&1 &
 pid=$!
-trap 'kill -INT "$pid" 2>/dev/null || true; rm -rf "$work"' EXIT
 for _ in $(seq 1 60); do
 	curl -sf "$base/healthz" >/dev/null 2>&1 && break
 	sleep 0.5
@@ -61,32 +82,44 @@ PY
 echo '{"long_url":"https://example.com/load"}' >"$work/create.json"
 printf 'POST %s/api/v1/links\nAuthorization: Bearer %s\n@%s\n' "$base" "$key" "$work/create.json" >"$work/creates.txt"
 
-# Sample the service's CPU once a second (100% = one core).
-( while kill -0 "$pid" 2>/dev/null; do ps -o %cpu= -p "$pid"; sleep 1; done ) >"$work/cpu.txt" &
-sampler=$!
+# The service's own CPU counter before and after the load gives the average
+# number of cores it used. (ps %cpu would differ: on Linux it averages over
+# the whole process lifetime, including the idle setup.)
+cpu_seconds() {
+	curl -s "http://127.0.0.1:$metrics_port/metrics" | awk '/^process_cpu_seconds_total / { print $2 }'
+}
+cpu_before="$(cpu_seconds)"
+start_ns="$(python3 -c 'import time; print(time.time_ns())')"
 if [ -n "${PROFILE:-}" ]; then
 	( sleep 3; curl -s "http://127.0.0.1:$metrics_port/debug/pprof/profile?seconds=10" >"${PROFILE_OUT:-cpu.pprof}" ) &
+	profiler=$!
 fi
 
 echo "load: $redirect_rate redirects/s and $create_rate creates/s for $duration"
 # Redirects are not followed: we measure the shortener, not the target site.
-"${vegeta[@]}" attack -targets="$work/redirects.txt" -rate="$redirect_rate" -duration="$duration" \
+"$vegeta" attack -targets="$work/redirects.txt" -rate="$redirect_rate" -duration="$duration" \
 	-redirects=-1 -max-workers=2000 >"$work/redirects.bin" &
 r=$!
-"${vegeta[@]}" attack -targets="$work/creates.txt" -rate="$create_rate" -duration="$duration" \
+"$vegeta" attack -targets="$work/creates.txt" -rate="$create_rate" -duration="$duration" \
 	-max-workers=2000 >"$work/creates.bin" &
 c=$!
 wait "$r" "$c"
-kill "$sampler" 2>/dev/null || true
-wait "$sampler" 2>/dev/null || true
+r="" c=""
+cpu_after="$(cpu_seconds)"
+end_ns="$(python3 -c 'import time; print(time.time_ns())')"
+if [ -n "$profiler" ]; then
+	wait "$profiler" || true
+	profiler=""
+	echo "profile: ${PROFILE_OUT:-cpu.pprof} ($(wc -c <"${PROFILE_OUT:-cpu.pprof}" | tr -d ' ') bytes)"
+fi
 
 code=0
 for scenario in "redirects:${REDIRECT_P99_MS:-100}" "creates:${CREATE_P99_MS:-500}"; do
 	name="${scenario%%:*}"
 	max_p99_ms="${scenario##*:}"
 	echo "--- $name"
-	"${vegeta[@]}" report -type=text <"$work/$name.bin" | grep -E '^(Requests|Latencies|Success|Status)'
-	"${vegeta[@]}" report -type=json <"$work/$name.bin" >"$work/$name.json"
+	"$vegeta" report -type=text <"$work/$name.bin" | grep -E '^(Requests|Latencies|Success|Status)'
+	"$vegeta" report -type=json <"$work/$name.bin" >"$work/$name.json"
 	python3 - "$work/$name.json" "$max_p99_ms" <<'PY' || code=1
 import json, sys
 r = json.load(open(sys.argv[1]))
@@ -97,8 +130,9 @@ sys.exit(0 if ok else 1)
 PY
 done
 
-echo "--- service CPU while loaded (100% = one core, $(getconf _NPROCESSORS_ONLN) cores)"
-awk '$1 > 5 { n++; s += $1; if ($1 > m) m = $1 } END { if (n) printf "avg %.0f%%, max %.0f%%\n", s / n, m; else print "idle" }' "$work/cpu.txt"
+echo "--- service CPU while loaded ($(getconf _NPROCESSORS_ONLN) cores available)"
+awk -v a="$cpu_before" -v b="$cpu_after" -v t0="$start_ns" -v t1="$end_ns" \
+	'BEGIN { printf "%.2f cores on average\n", (b - a) / ((t1 - t0) / 1e9) }'
 echo "--- cache lookups by level"
 curl -s "http://127.0.0.1:$metrics_port/metrics" | grep '^cache_lookups_total' || true
 echo "--- errors in the server log: $(grep -c '"level":"ERROR"' "$work/server.log" || true)"
