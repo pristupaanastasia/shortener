@@ -17,6 +17,8 @@ The first two sections show how to run and test it; the rest is the design docum
  │                                │──clicks▶ Kafka     :9092   click events       │
  │ consumer           (no port)   │◀───────│                                      │
  │                                │───────▶│ ClickHouse:9000   click statistics   │
+ │ cleanup  (runs once, exits)    │───────▶│ Cassandra         expired links      │
+ │                                │───────▶│ S3        :8333   archive (SeaweedFS)│
  └────────────────────────────────┘        └──────────────────────────────────────┘
 ```
 
@@ -25,7 +27,7 @@ Requirements: Go 1.26.3 and Docker. Every dependency is optional: without any, t
 ```
 make run                      # in memory: links, accounts and rate limits in the process
 
-make up                       # Cassandra, Redis, PostgreSQL, Kafka, ClickHouse
+make up                       # Cassandra, Redis, PostgreSQL, Kafka, ClickHouse, S3
 STORAGE=cassandra \
 REDIS_ADDR=127.0.0.1:6379 \
 POSTGRES_DSN='postgres://shortener:shortener@127.0.0.1:5432/shortener?sslmode=disable' \
@@ -36,6 +38,8 @@ CLICKHOUSE_DSN='clickhouse://shortener:shortener@127.0.0.1:9000/shortener' \
 KAFKA_BROKERS=127.0.0.1:9092 \
 CLICKHOUSE_DSN='clickhouse://shortener:shortener@127.0.0.1:9000/shortener' \
   go run ./cmd/consumer       # analytics: Kafka -> ClickHouse
+
+make cleanup                  # archive expired links to S3 once (a daily CronJob in Kubernetes)
 
 make down                     # stop the dependencies (data stays in volumes)
 ```
@@ -71,14 +75,16 @@ All settings are environment variables.
 
 The consumer (`cmd/consumer`) reads `KAFKA_BROKERS`, `KAFKA_TOPIC`, `KAFKA_GROUP` (`analytics`), `CLICKHOUSE_DSN`, `BATCH_SIZE` (`10000`) and `FLUSH_INTERVAL` (`1s`).
 
+The cleanup worker (`cmd/cleanup`) reads `CASSANDRA_HOSTS`, `CASSANDRA_KEYSPACE`, `CASSANDRA_REPLICATION_FACTOR`, `ARCHIVE_ENDPOINT` (`127.0.0.1:8333`), `ARCHIVE_BUCKET` (`shortener-archive`), `ARCHIVE_PREFIX` (empty), `ARCHIVE_ACCESS_KEY` / `ARCHIVE_SECRET_KEY` (`shortener`), `ARCHIVE_SECURE` (`true` for HTTPS) and `CLEANUP_LOOKBACK_DAYS` (`30`: where the first run starts).
+
 ## Testing
 
 | Level | Command | What it covers |
 |---|---|---|
 | Lint | `make lint` | `gofmt`, `go vet` (including integration-tagged files) |
-| Unit | `make test` | 91 test functions with the race detector; Redis via miniredis, stores in memory |
-| Integration | `make test-integration` | + 19 test functions against the `make up` stack: Cassandra LWTs and concurrent inserts, migrations on fresh databases, ClickHouse aggregates, the Kafka pipeline with a failing sink, real Redis |
-| Smoke | `make smoke`, `make smoke-full` | builds and starts the real binaries and walks through the user journey with curl (15 checks in memory, 17 on the full stack: register, create, redirect, patch, list, click statistics, delete, auth errors, metrics, clean shutdown) |
+| Unit | `make test` | 97 test functions with the race detector; Redis via miniredis, stores in memory |
+| Integration | `make test-integration` | + 28 test functions against the `make up` stack: Cassandra LWTs and concurrent inserts, the cleanup worker with concurrent workers and no lease, S3, migrations on fresh databases, ClickHouse aggregates, the Kafka pipeline with a failing sink, real Redis |
+| Smoke | `make smoke`, `make smoke-full` | builds and starts the real binaries and walks through the user journey with curl (15 checks in memory, 22 on the full stack: register, create, redirect, patch, list, click statistics, delete, auth errors, archiving an expired link, metrics, clean shutdown) |
 | Coverage gate | `make coverage` | unit + integration tests and `smoke-full` (its binaries are built with `-cover`); fails below 80% |
 | Load | `make loadtest` | redirects and creates at once with vegeta; fails if redirect p99 ≥ 100 ms, create p99 ≥ 500 ms or success < 99%; see [Load Test Results](#load-test-results) |
 | Kubernetes | `make k8s-smoke`, `make k8s-rollout` | the smoke test against the cluster; a rolling restart under 200 requests/s from inside the cluster with no failed requests allowed |
@@ -87,13 +93,13 @@ Tests are table-driven (`.claude/skills/go-table-tests`); every database has mig
 
 **Where they run:** the pre-push hook (`make hooks`) runs lint and `make coverage` on the tip of every pushed branch, so pushing needs `make up`. CI (`.github/workflows/ci.yml`) runs the same on every push and pull request against service containers.
 
-**Latest results** (2026-11-16, branch `milestone/m9-redis-circuit-breaker`):
+**Latest results** (2026-11-16, branch `milestone/m10-cleanup-worker`):
 
 | Check | Result |
 |---|---|
-| Unit + integration | 110 test functions, 437 cases, all passing |
+| Unit + integration | 125 test functions, 503 cases, all passing |
 | Coverage | 89.6% of statements (minimum 80%) |
-| Smoke | 15/15 in memory, 17/17 on the full stack, 14/14 against minikube |
+| Smoke | 15/15 in memory, 22/22 on the full stack, 14/14 against minikube |
 | Load | redirects: 30K/s with p99 1.2 ms; creates: 10K/s with p99 19.7 ms (after M7); 0 errors |
 | Rolling restart in Kubernetes | 9000 of 9000 requests succeeded |
 | CI | green, ~2.5 min (~4.5 min when `go.sum` changes and the module cache is rebuilt) |
@@ -496,10 +502,24 @@ CREATE TABLE links_by_user (
     expires_at  timestamp,
     PRIMARY KEY ((user_id), created_at, key)
 ) WITH CLUSTERING ORDER BY (created_at DESC, key ASC);
+
+-- expired links for the cleanup worker
+CREATE TABLE links_by_expiry (
+    day         date,        -- UTC day of expires_at
+    bucket      int,         -- fnv32(key) % 256
+    expires_at  timestamp,
+    key         text,
+    PRIMARY KEY ((day, bucket), expires_at, key)
+);
+
+-- cleanup worker state
+CREATE TABLE cleanup_lease (name text PRIMARY KEY, owner text);    -- rows written with a TTL
+CREATE TABLE cleanup_checkpoint (name text PRIMARY KEY, day date); -- first day not done yet
 ```
 
 - `links_by_user` uses `user_id` as the **partition key** (all of a user's links live on one node) and `created_at, key` as the **clustering key** (rows are pre-sorted, which is exactly the API cursor).
 - This is **query-first modeling**: one table per query. Each link is written to both tables (denormalization is normal in Cassandra).
+- `links_by_expiry` serves "links that expired before T" without a full scan. A partition per day alone would hold up to 100M rows (~6 GB) at the estimated write rate; 256 buckets keep each at ~20 MB. It is a **hint, not the truth**: changing `expires_at` adds a row for the new day and leaves the old one, and the worker re-reads `links` and skips links whose expiry no longer matches. So `Update` does not need to know the old value.
 
 ### Cassandra Pitfalls
 
@@ -583,7 +603,7 @@ All services are **stateless**: state lives only in the storage layer, so servic
    - **hit** (most requests): go to step 4; **miss**: go to step 3.
 3. **Cassandra** `SELECT ... WHERE key = 'abc1234'` with consistency `QUORUM`. With `QUORUM` writes, `W + R > N` guarantees the read sees the latest write; with `ONE`, a miss could load a stale replica into the cache for an hour. Misses are a small fraction of traffic, so the extra cost is affordable.
    - Concurrent misses for the same key on one instance are collapsed into one Cassandra read (`singleflight`), which prevents a cache stampede when a hot key expires.
-   - The result is cached in Redis with `TTL = 1h + random(0, 10m)`. The jitter keeps entries that were cached together from expiring together (cache avalanche). Expired and deleted links are cached too: the service checks `expires_at`/`deleted_at` on every read, so 410 is served from cache.
+   - The result is cached in Redis with `TTL = 1h + random(0, 10m)`, but never past the link's `expires_at`; an expired link that the cleanup worker has not tombstoned yet is cached for 1 minute only, since the worker does not touch the cache. The jitter keeps entries that were cached together from expiring together (cache avalanche). Expired and deleted links are cached too: the service checks `expires_at`/`deleted_at` on every read, so 410 is served from cache.
    - **Negative caching:** a missing key is cached as "not found" for 1 minute. Otherwise a bot enumerating random keys would bypass the cache and flood Cassandra. Creating an alias drops its negative entry, so a new alias resolves immediately (other instances' L1 may serve 404 for up to 10s). For generated keys this Redis round trip is skipped (it was 8.6% of service CPU at 10K creates/s): a random key is practically never looked up before it exists, so the rare stale "not found" lasts at most the 1-minute negative TTL.
    - **Redis failures are treated as misses**, never as errors. The Redis client uses tight timeouts and minimal retries: with library defaults, an unavailable Redis added ~5 s to every request (measured in tests).
    - **Circuit breaker** (`internal/breaker`): after 5 consecutive Redis failures, every Redis call fails at once for 2 s, then one probe decides whether to close. A missing key and an error reply from the server count as answers, not failures. It is a go-redis hook shared by all Redis clients, so cache, rate limiter and idempotency skip Redis together. While it is open, nothing is logged per call, failed probes included: the opening and the recovery are logged once each, and `redis_circuit_state` (0 closed, 1 half-open, 2 open) shows the state.
@@ -652,10 +672,31 @@ Kafka acts as a **buffer**: if ClickHouse is slow or down, events accumulate in 
 
 ### Flow 5: Expired links
 
-The **Cleanup Worker** runs daily, finds links with `expires_at` in the past and moves them to cheap cold storage (e.g. S3). A **tombstone row** (key + `deleted_at`) stays in Cassandra, so:
+The **Cleanup Worker** (`cmd/cleanup`, a daily Kubernetes `CronJob`) finds links with `expires_at` in the past and moves them to cheap cold storage (S3; SeaweedFS locally). A **tombstone row** (key + `deleted_at`, the URL nulled) stays in Cassandra, so:
 
 - the redirect returns 410, not 404;
-- the key or alias is never reused.
+- the key or alias is never reused;
+- the link leaves its owner's listing.
+
+**How a run works.** From the checkpoint (the first day not done) up to today, for each of the 256 buckets of a day, in parallel:
+
+1. Read up to 500 index entries with `expires_at < now`, starting after the last entry of the previous batch: `(expires_at, key) > (?, ?)`.
+2. Re-read each link from `links`. Skip it if it was extended, deleted or is missing.
+3. **Archive first:** the batch goes to one JSON Lines object, `expired/<day>/<bucket>/<first key>-<run time>.jsonl`.
+4. **Then tombstone:** `UPDATE links SET long_url = null, deleted_at = ? IF expires_at = <as read> AND long_url = <as read> AND deleted_at = null`, and remove the link from `links_by_user`. If the owner extended the link or changed its URL after step 2, the condition fails and the owner wins: the archive just holds an extra record, and a still-expired link is archived with its new URL by the next run.
+
+Index entries are **never deleted one by one**. Each deletion is a Cassandra tombstone, and a read scans every tombstone before its first live row: with deletions after each batch, reads of a partition got slower and failed after 100K deleted rows (`READ_TOO_MANY_TOMBSTONES`, the default threshold; found in review, at ~390K rows per partition the nightly run would have failed every time). A past day is complete (links cannot be created or extended into the past), so its partitions are deleted as a whole (one tombstone each) and the checkpoint moves past it. Today stays open, since links keep expiring until midnight: the next run reads today's partition from its start again and skips what is done (one read per link).
+
+**Failures.** Every step can be repeated, so a crashed run is simply run again:
+
+- Crash after archiving, before tombstoning: the next run archives the batch again. The archive is **at-least-once** (records carry the key; readers keep one per key), but a link is never tombstoned without being archived. Objects are never replaced: a repeated batch may be smaller, and replacing the earlier object would lose records.
+- S3 down: nothing is tombstoned; the run fails and the next one retries.
+
+**Several workers.** A lease in Cassandra (`INSERT ... IF NOT EXISTS USING TTL 300`, renewed every 100 s) lets one run at a time do the work; a crashed holder blocks the next run for at most 5 minutes. The lease only saves work, **correctness does not depend on it**: every tombstone is a lightweight transaction. Verified by an integration test with four workers and no lease: each of 40 links was tombstoned exactly once (without `deleted_at = null` in the condition, the same test counted 130 tombstones).
+
+**Throughput.** The run starts daily at 03:00 and may take up to 20 h (the Job's `activeDeadlineSeconds`, retries included), so a day of 100M expiring links needs **~1.4K links/s**, plus re-reading the part of the day done at 03:00 of the day before. Per link it is a read and an LWT, plus one archive object per 500 links. Measured locally (one Cassandra node, RF 1, 16 buckets in parallel): 5,000 links in 0.88 s, **~5.7K links/s**. LWTs at RF 3 with QUORUM are slower; production throughput is untested here, and `Parallel` is the knob.
+
+**Not covered:** links created before the expiry index existed (migration 0003) have no index entries and are never archived; they would need a one-off backfill that scans `links`. Soft-deleted links that never expire keep their URL.
 
 ### Consistency Between Stores (Dual Writes)
 
@@ -803,6 +844,7 @@ Manifests are in `k8s/` (kustomize). `k8s/base` describes the service in any clu
 | `Service/shortener` | port 80 → 8080, traffic only: `/metrics` and `/debug/pprof` (9091) are not in the Service. Prometheus scrapes the pods directly, so the metrics server listens on all pod interfaces; in a real cluster, a NetworkPolicy should limit port 9091 to the monitoring namespace |
 | `HorizontalPodAutoscaler/shortener` | 3–20 replicas at 70% CPU: the load test measured ~23K redirects/s per core |
 | `PodDisruptionBudget/shortener` | node drains take at most one pod at a time |
+| `CronJob/cleanup` | the cleanup worker, daily at 03:00 UTC; `concurrencyPolicy: Forbid`, and the Cassandra lease covers runs Kubernetes does not know about |
 | `Deployment/consumer` | the analytics consumer; replicas up to the number of partitions of the clicks topic |
 | `ConfigMap` / `Secret` | addresses of the dependencies; credentials (PostgreSQL and ClickHouse DSNs) |
 

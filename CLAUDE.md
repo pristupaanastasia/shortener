@@ -13,6 +13,7 @@ URL shortener in Go, built as a learning project for system design and agentic d
 - `make test`: tests only.
 - `make test-integration`: unit + integration tests (`integration` build tag); needs `make up`. Run it before committing changes to storage, caches or queues.
 - `make run`: start the service locally.
+- `make cleanup`: run the cleanup worker once against the `make up` stack.
 - `make coverage`: unit + integration tests and the full-stack smoke test with a total coverage minimum of 80% (`COVERAGE_MIN`); the smoke test's binaries are built with `-cover`, so `main` and wiring count too. Needs `make up`.
 - `make smoke` / `make smoke-full`: build and start the real service, walk through the main user journey with curl, check a clean shutdown; in memory, or against the `make up` stack.
 - `make loadtest`: load test against the `make up` stack (redirects + creates with vegeta); fails if the latency requirements are not met. `/metrics` and `/debug/pprof` are on `METRICS_ADDR` (default `127.0.0.1:9091`, localhost only; empty disables it).
@@ -26,6 +27,7 @@ URL shortener in Go, built as a learning project for system design and agentic d
 ```
 cmd/shortener/      main: config, wiring, graceful shutdown
 cmd/consumer/       analytics consumer: Kafka -> ClickHouse
+cmd/cleanup/        cleanup worker: archives expired links to S3, run daily
 migrations/<db>/    versioned schema migrations, embedded and applied on startup
 internal/
   httpapi/          HTTP handlers, routing, middleware
@@ -35,6 +37,8 @@ internal/
   cache/            Redis and in-process caches
   migrate/          migration loader shared by the database runners
   analytics/        click events, Kafka publisher and consumer, stats types
+  cleanup/          cleanup worker: expired links -> archive + tombstone, lease
+  breaker/          circuit breaker (go-redis hook)
 ```
 
 New packages go under `internal/`. Keep `cmd/` thin.

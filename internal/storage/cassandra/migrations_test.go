@@ -57,7 +57,7 @@ func TestMigrations(t *testing.T) {
 	}{
 		{name: "fresh keyspace", action: func(t *testing.T, s *Store) {
 			tables := tablesIn(t, admin, ks)
-			for _, want := range []string{"links", "links_by_user", "schema_migrations"} {
+			for _, want := range []string{"links", "links_by_user", "links_by_expiry", "cleanup_lease", "cleanup_checkpoint", "schema_migrations"} {
 				if !slices.Contains(tables, want) {
 					t.Errorf("table %s missing; tables = %v", want, tables)
 				}

@@ -77,6 +77,11 @@ jobs:
       - name: Lint
         run: make lint
 
+      # Service containers take neither a command nor a config file, which
+      # the S3 server (cold storage of the cleanup worker) needs.
+      - name: Start S3
+        run: docker compose up -d --wait s3
+
       # Includes the full-stack smoke test, whose binaries count toward coverage.
       - name: Tests, smoke test and coverage minimum
         run: make coverage

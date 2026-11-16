@@ -1,0 +1,9 @@
+{
+  "identities": [
+    {
+      "name": "shortener",
+      "credentials": [{ "accessKey": "shortener", "secretKey": "shortener" }],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }
+  ]
+}

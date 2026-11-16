@@ -17,6 +17,8 @@ configMapGenerator:
       - BASE_URL=http://127.0.0.1:18080
       # The smoke test makes many anonymous requests from one IP.
       - RATE_LIMIT_ANONYMOUS=1000
+      - ARCHIVE_ENDPOINT=host.minikube.internal:8333
+      - ARCHIVE_SECURE=false
 secretGenerator:
   # Development credentials of the docker compose stack.
   - name: shortener-secrets
@@ -24,12 +26,20 @@ secretGenerator:
     literals:
       - POSTGRES_DSN=postgres://shortener:shortener@host.minikube.internal:5432/shortener?sslmode=disable
       - CLICKHOUSE_DSN=clickhouse://shortener:shortener@host.minikube.internal:9000/shortener
+      - ARCHIVE_ACCESS_KEY=shortener
+      - ARCHIVE_SECRET_KEY=shortener
 patches:
   - target:
       kind: Deployment
     patch: |-
       - op: add
         path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Never
+  - target:
+      kind: CronJob
+    patch: |-
+      - op: add
+        path: /spec/jobTemplate/spec/template/spec/containers/0/imagePullPolicy
         value: Never
   - target:
       kind: HorizontalPodAutoscaler

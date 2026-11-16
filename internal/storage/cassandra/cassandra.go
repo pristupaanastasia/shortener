@@ -39,6 +39,7 @@ type Store struct {
 	deleteLink       string
 	deleteLinkByUser string
 	listLinksByUser  string
+	insertExpiry     string
 	ks               string
 }
 
@@ -90,6 +91,8 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 			WHERE user_id = ? AND created_at = ? AND key = ?`, ks),
 		listLinksByUser: fmt.Sprintf(`SELECT key, long_url, created_at, expires_at
 			FROM %s.links_by_user WHERE user_id = ?`, ks),
+		insertExpiry: fmt.Sprintf(`INSERT INTO %s.links_by_expiry (day, bucket, expires_at, key)
+			VALUES (?, ?, ?, ?)`, ks),
 		ks: ks,
 	}, nil
 }
@@ -157,7 +160,8 @@ func applyMigrations(ctx context.Context, session *gocql.Session) error {
 //
 // The insert into links is a lightweight transaction, which guarantees key
 // uniqueness. Cassandra does not allow a conditional batch to span tables,
-// so links_by_user is written afterwards with a plain, idempotent insert.
+// so links_by_expiry and links_by_user are written afterwards with plain,
+// idempotent inserts.
 func (s *Store) Create(ctx context.Context, l link.Link, _ link.CreateOptions) error {
 	userID, err := parseUserID(l.UserID)
 	if err != nil {
@@ -174,28 +178,47 @@ func (s *Store) Create(ctx context.Context, l link.Link, _ link.CreateOptions) e
 		return link.ErrKeyTaken
 	}
 
-	if userID == nil {
-		return nil
+	// The link is stored at this point; a failure below would leave it out
+	// of the expiry index or its owner's listing, and a retry of the request
+	// could not repair it (the key is now taken). The inserts are
+	// idempotent, so they are retried.
+	// Both are attempted even if one fails.
+	var indexErr, listErr error
+	if l.ExpiresAt != nil {
+		indexErr = s.indexExpiry(ctx, l.Key, *l.ExpiresAt)
 	}
-	// The link is stored at this point; a failure here would leave it out of
-	// its owner's listing, and a retry of the request could not repair it
-	// (the key is now taken). The insert is idempotent, so retry it.
+	if userID != nil {
+		listErr = retry(ctx, func() error {
+			err := s.session.Query(s.insertLinkByUser,
+				userID, l.CreatedAt, l.Key, l.LongURL, l.ExpiresAt,
+			).ExecContext(ctx)
+			if err != nil {
+				return fmt.Errorf("insert link %q into links_by_user: %w", l.Key, err)
+			}
+			return nil
+		})
+	}
+	return errors.Join(indexErr, listErr)
+}
+
+// secondaryWriteAttempts bounds retries of the writes to the index tables
+// that follow a successful write to links.
+const secondaryWriteAttempts = 3
+
+// retry runs an idempotent write until it succeeds, up to
+// secondaryWriteAttempts times.
+func retry(ctx context.Context, write func() error) error {
 	for attempt := 1; ; attempt++ {
-		err = s.session.Query(s.insertLinkByUser,
-			userID, l.CreatedAt, l.Key, l.LongURL, l.ExpiresAt,
-		).ExecContext(ctx)
+		err := write()
 		if err == nil {
 			return nil
 		}
-		if attempt == listingWriteAttempts || ctx.Err() != nil {
-			return fmt.Errorf("insert link %q into links_by_user: %w", l.Key, err)
+		if attempt == secondaryWriteAttempts || ctx.Err() != nil {
+			return err
 		}
 		time.Sleep(time.Duration(attempt) * 50 * time.Millisecond)
 	}
 }
-
-// listingWriteAttempts bounds retries of the links_by_user insert in Create.
-const listingWriteAttempts = 3
 
 // Get implements link.Store.
 func (s *Store) Get(ctx context.Context, key string) (link.Link, error) {
@@ -242,16 +265,23 @@ func (s *Store) Update(ctx context.Context, l link.Link, f link.Fields) error {
 	if !applied {
 		return link.ErrNotFound // missing or deleted
 	}
+	// The row for the old expiry stays: the cleanup worker re-reads the link
+	// and skips it, so Update does not need to know the old value.
+	// Both are attempted even if one fails.
+	var indexErr error
+	if f.ExpiresAt && l.ExpiresAt != nil {
+		indexErr = s.indexExpiry(ctx, l.Key, *l.ExpiresAt)
+	}
 
 	userID, err := parseUserID(l.UserID)
 	if err != nil || userID == nil {
-		return err
+		return errors.Join(indexErr, err)
 	}
 	stmt = fmt.Sprintf(`UPDATE %s.links_by_user SET %s WHERE user_id = ? AND created_at = ? AND key = ?`, s.ks, assignments)
 	if err := s.session.Query(stmt, append(args, userID, l.CreatedAt, l.Key)...).ExecContext(ctx); err != nil {
-		return fmt.Errorf("update link %q in links_by_user: %w", l.Key, err)
+		return errors.Join(indexErr, fmt.Errorf("update link %q in links_by_user: %w", l.Key, err))
 	}
-	return nil
+	return indexErr
 }
 
 // Delete implements link.Store. The links row keeps its first deletion time;
