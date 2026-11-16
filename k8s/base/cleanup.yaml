@@ -1,0 +1,54 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cleanup
+spec:
+  # Daily, at a quiet hour (UTC). Links that expired today are archived the
+  # next day; until then they already answer 410.
+  schedule: "0 3 * * *"
+  timeZone: Etc/UTC
+  # A run still going when the next is due is left alone; the lease in
+  # Cassandra covers runs Kubernetes does not know about.
+  concurrencyPolicy: Forbid
+  # A run missed by more than this (cluster down) is skipped; the next one
+  # continues from the checkpoint.
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # A failed run is retried; each run continues where the last stopped.
+      backoffLimit: 3
+      activeDeadlineSeconds: 14400
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: cleanup
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532 # distroless nonroot; a numeric UID lets the kubelet verify it
+            runAsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: cleanup
+              image: shortener:dev
+              command: ["/usr/local/bin/cleanup"]
+              envFrom:
+                - configMapRef:
+                    name: shortener-config
+                - secretRef:
+                    name: shortener-secrets
+              resources:
+                requests:
+                  cpu: 250m
+                  memory: 64Mi
+                limits:
+                  memory: 256Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]

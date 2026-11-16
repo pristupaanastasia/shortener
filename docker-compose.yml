@@ -103,7 +103,26 @@ services:
       retries: 20
       start_period: 10s
 
+  # Cold storage for expired links (S3 API). SeaweedFS rather than MinIO:
+  # MinIO no longer publishes community images. Signed requests need an
+  # identity: access and secret key "shortener" (deploy/seaweedfs-s3.json).
+  s3:
+    image: chrislusf/seaweedfs:3.80
+    ports:
+      - "8333:8333"
+    command: ["server", "-dir=/data", "-s3", "-s3.port=8333", "-s3.config=/etc/seaweedfs/s3.json", "-volume.max=0", "-master.volumeSizeLimitMB=64"]
+    volumes:
+      - s3-data:/data
+      - ./deploy/seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8333/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
 volumes:
+  s3-data:
   clickhouse-data:
   cassandra-data:
   postgres-data:

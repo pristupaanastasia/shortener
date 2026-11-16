@@ -8,6 +8,7 @@ resources:
   - namespace.yaml
   - shortener.yaml
   - consumer.yaml
+  - cleanup.yaml
 configMapGenerator:
   # Addresses of the dependencies as in-cluster Service names; overlays
   # replace them for their environment. Credentials live in the Secret
@@ -25,6 +26,9 @@ configMapGenerator:
       # the pod IP.
       - METRICS_ADDR=:9091
       - BASE_URL=https://sho.rt
+      - ARCHIVE_ENDPOINT=s3:8333
+      - ARCHIVE_BUCKET=shortener-archive
+      - ARCHIVE_SECURE=true
 secretGenerator:
   # Declared here (empty) so that the Deployments' references follow the
   # generated name; every overlay must fill it with behavior: merge. The base
@@ -34,3 +38,5 @@ secretGenerator:
     literals:
       - POSTGRES_DSN=
       - CLICKHOUSE_DSN=
+      - ARCHIVE_ACCESS_KEY=
+      - ARCHIVE_SECRET_KEY=

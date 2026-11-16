@@ -1,8 +1,13 @@
-.PHONY: build run test test-integration coverage smoke smoke-full loadtest lint check up down hooks k8s-up k8s-deploy k8s-smoke k8s-rollout k8s-down k8s-destroy
+.PHONY: build cleanup run test test-integration coverage smoke smoke-full loadtest lint check up down hooks k8s-up k8s-deploy k8s-smoke k8s-rollout k8s-down k8s-destroy
 
 build:
 	go build -o bin/shortener ./cmd/shortener
 	go build -o bin/consumer ./cmd/consumer
+	go build -o bin/cleanup ./cmd/cleanup
+
+# Archive expired links once (the worker a CronJob runs daily).
+cleanup:
+	go run ./cmd/cleanup
 
 run:
 	go run ./cmd/shortener
@@ -29,6 +34,7 @@ smoke-full:
 	POSTGRES_DSN="postgres://shortener:shortener@127.0.0.1:5432/shortener?sslmode=disable" \
 	KAFKA_BROKERS=127.0.0.1:9092 \
 	CLICKHOUSE_DSN="clickhouse://shortener:shortener@127.0.0.1:9000/shortener" \
+	ARCHIVE_ENDPOINT=127.0.0.1:8333 \
 	./scripts/smoke.sh
 
 # Load test against the `make up` stack; fails if the latency requirements

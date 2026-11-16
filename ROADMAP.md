@@ -100,3 +100,16 @@ A hung Redis (accepts connections, never answers) costs the 50 ms timeout on eve
 - [x] Measure again with the same hung Redis
 
 **Done when:** `make check` and `make coverage` pass; with a hung Redis, redirect p99 is back under 100 ms and warnings drop to the state changes; the breaker closes again when Redis recovers.
+
+## M10: Cleanup Worker
+
+README Flow 5: expired links are archived to cold storage and replaced by tombstones, so redirects keep returning 410 and keys are never reused. Until now expired links stayed in Cassandra forever.
+
+- [x] Migration: `links_by_expiry` (partition = expiry day + bucket, clustered by `expires_at`), written by `Create` and by `Update` when `expires_at` changes; the index is a hint, `links` stays the source of truth
+- [x] `internal/cleanup`: per partition, re-read each link; archive it, then tombstone it with a lightweight transaction that fails if the link was extended or deleted meanwhile, then drop the index row; every step can be repeated
+- [x] Cold storage: an S3-compatible archive (MinIO in `docker-compose.yml`), JSON Lines objects
+- [x] A lease (Cassandra LWT with TTL) so that concurrent workers do not repeat work; correctness does not depend on it
+- [x] `cmd/cleanup`, a CronJob in `k8s/`, a step in the full-stack smoke test
+- [x] Integration tests: archive + tombstone, extended link, crash between archive and tombstone, concurrent workers
+
+**Done when:** `make check`, `make test-integration` and `make coverage` pass; in the smoke test, an expired link is archived to MinIO, its redirect still returns 410, its alias cannot be taken again, and it disappears from its owner's listing.

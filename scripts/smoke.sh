@@ -9,6 +9,9 @@
 # that already running service (e.g. a port-forward into Kubernetes), and the
 # shutdown checks are skipped. SMOKE_ANALYTICS=1 checks click statistics and
 # SMOKE_METRICS_URL the metrics endpoint in that mode.
+#
+# With STORAGE=cassandra and ARCHIVE_ENDPOINT set, the cleanup worker runs
+# too: a link that expires during the run must be archived and tombstoned.
 set -euo pipefail
 
 port="${SMOKE_PORT:-18181}"
@@ -38,6 +41,13 @@ if [ -n "${SMOKE_COVERDIR:-}" ]; then
 	export GOCOVERDIR="$SMOKE_COVERDIR"
 fi
 
+cleanup=false
+if ! $external && [ "${STORAGE:-}" = cassandra ] && [ -n "${ARCHIVE_ENDPOINT:-}" ]; then
+	cleanup=true
+	# Objects of smoke runs stay apart from real archives.
+	export ARCHIVE_PREFIX="smoke/"
+fi
+
 pid=""
 consumer_pid=""
 if ! $external; then
@@ -46,6 +56,9 @@ if ! $external; then
 	# concurrent runs) would exceed the default anonymous limit of 10/min.
 	RATE_LIMIT_ANONYMOUS=1000 METRICS_ADDR="${metrics_url#http://}" ADDR=":$port" BASE_URL="$base" "$work/shortener" >"$log" 2>&1 &
 	pid=$!
+	if $cleanup; then
+		"${build[@]}" -o "$work/cleanup" ./cmd/cleanup
+	fi
 	if $analytics; then
 		"${build[@]}" -o "$work/consumer" ./cmd/consumer
 		KAFKA_GROUP=smoke FLUSH_INTERVAL=200ms "$work/consumer" >"$work/consumer.log" 2>&1 &
@@ -99,6 +112,14 @@ key="$(printf '%s' "$body" | sed -n 's/.*"api_key":"\([^"]*\)".*/\1/p')"
 expect "register returns an api key" "sk_" "${key:0:3}"
 auth=(-H "Authorization: Bearer $key")
 
+if $cleanup; then
+	# Created first, so it has expired by the time the worker runs.
+	expiring="smokeexp$run"
+	expires_at="$(date -u -v+3S +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '+3 seconds' +%Y-%m-%dT%H:%M:%SZ)"
+	expiring_body="{\"long_url\":\"https://example.com/expiring\",\"alias\":\"$expiring\",\"expires_at\":\"$expires_at\"}"
+	expect "create an expiring link" 201 "$(status -X POST "$base/api/v1/links" "${auth[@]}" -d "$expiring_body")"
+fi
+
 # JSON bodies are built outside $(...): bash 3.2 (macOS) brace-expands
 # "{a,b}" inside a command substitution in double quotes, splitting the body.
 create_body="{\"long_url\":\"https://example.com/v1\",\"alias\":\"$alias\"}"
@@ -125,6 +146,28 @@ expect "list without key" 401 "$(status "$base/api/v1/links")"
 expect "delete link" 204 "$(status -X DELETE "$base/api/v1/links/$alias" "${auth[@]}")"
 expect "redirect after delete" 410 "$(status "$base/$alias")"
 expect "unknown key" 404 "$(status "$base/nosuchkey$run")"
+if $cleanup; then
+	for _ in $(seq 1 20); do
+		[ "$(status "$base/$expiring")" = 410 ] && break # expired
+		sleep 0.5
+	done
+	# Another worker (a concurrent smoke run) may hold the lease: retry.
+	archived=false
+	for _ in $(seq 1 20); do
+		CLEANUP_LOOKBACK_DAYS=1 "$work/cleanup" >>"$work/cleanup.log" 2>&1 || fail "cleanup failed: $(cat "$work/cleanup.log")"
+		if go run ./scripts/archived "$expiring"; then
+			archived=true
+			break
+		fi
+		sleep 1
+	done
+	expect "cleanup archives the expired link" true "$archived"
+	expect "expired link still answers 410" 410 "$(status "$base/$expiring")"
+	listed="$(curl -s "$base/api/v1/links" "${auth[@]}" | grep -c "\"key\":\"$expiring\"" || true)"
+	expect "archived link left the listing" 0 "$listed"
+	reuse_body="{\"long_url\":\"https://example.com/reuse\",\"alias\":\"$expiring\"}"
+	expect "archived alias cannot be taken again" 409 "$(status -X POST "$base/api/v1/links" "${auth[@]}" -d "$reuse_body")"
+fi
 if ! $external || [ -n "${SMOKE_METRICS_URL:-}" ]; then
 	redirects="$(curl -s "$metrics_url/metrics" | grep -c '^http_requests_total{code="301",method="GET",route="GET /{key}"}' || true)"
 	expect "metrics count redirects by route pattern" 1 "$redirects"
