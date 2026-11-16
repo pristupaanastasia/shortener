@@ -43,7 +43,10 @@ type config struct {
 
 	// Requests per minute; zero means the httpapi defaults.
 	anonymousLimit int
-	userLimit      int
+	// rateLimitSync is how often counters are synced to Redis; 0 makes every
+	// request a Redis transaction (exact limits).
+	rateLimitSync time.Duration
+	userLimit     int
 
 	kafkaBrokers  []string // empty: clicks are not published
 	kafkaTopic    string
@@ -90,6 +93,11 @@ func loadConfig() (config, error) {
 			*limit.dst = n
 		}
 	}
+	sync, err := time.ParseDuration(getenv("RATE_LIMIT_SYNC_INTERVAL", "100ms"))
+	if err != nil || sync < 0 {
+		return config{}, fmt.Errorf("RATE_LIMIT_SYNC_INTERVAL must be a duration like 100ms, or 0")
+	}
+	cfg.rateLimitSync = sync
 	cfg.kafkaTopic = getenv("KAFKA_TOPIC", analytics.Topic)
 	if brokers := os.Getenv("KAFKA_BROKERS"); brokers != "" {
 		cfg.kafkaBrokers = strings.Split(brokers, ",")
@@ -187,7 +195,13 @@ func run(logger *slog.Logger) error {
 			logger.Warn("redis unavailable, serving from storage until it recovers", "err", err)
 		}
 		store = cached
-		api.Limiter = ratelimit.New(rdb)
+		if cfg.rateLimitSync > 0 {
+			limiter := ratelimit.NewBatched(rdb, cfg.rateLimitSync, logger)
+			defer limiter.Close() // after the server has stopped: flushes the last counts
+			api.Limiter = limiter
+		} else {
+			api.Limiter = ratelimit.New(rdb)
+		}
 		api.Idempotency = idempotency.New(rdb, idempotency.DefaultTTL)
 	} else {
 		logger.Warn("REDIS_ADDR is not set: caching, rate limiting and Idempotency-Key are disabled")

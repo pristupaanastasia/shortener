@@ -2,6 +2,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -29,12 +30,18 @@ const (
 	DefaultUserLimit      = 100
 )
 
+// RateLimiter decides whether a subject is within its quota: the exact
+// ratelimit.Limiter or the approximate ratelimit.Batched.
+type RateLimiter interface {
+	Allow(ctx context.Context, subject string, limit int, window time.Duration) (ratelimit.Result, error)
+}
+
 // Config wires the handler's dependencies.
 type Config struct {
 	Links    *link.Service
 	Accounts *account.Service
 	// Limiter and Idempotency are optional (nil disables them); both need Redis.
-	Limiter     *ratelimit.Limiter
+	Limiter     RateLimiter
 	Idempotency *idempotency.Store
 	// Clicks receives an event per redirect and Stats serves statistics;
 	// both are optional (nil disables analytics).
@@ -57,7 +64,7 @@ type Config struct {
 type Handler struct {
 	links          *link.Service
 	accounts       *account.Service
-	limiter        *ratelimit.Limiter
+	limiter        RateLimiter
 	idempotency    *idempotency.Store
 	clicks         analytics.Publisher
 	stats          analytics.StatsReader

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"testing"
+	"time"
 )
 
 func TestLoadConfig(t *testing.T) {
@@ -19,6 +20,9 @@ func TestLoadConfig(t *testing.T) {
 			}
 			if cfg.cassandra.Keyspace != "shortener" || cfg.cassandra.ReplicationFactor != 1 || len(cfg.cassandra.Hosts) != 1 {
 				t.Errorf("cassandra = %+v", cfg.cassandra)
+			}
+			if cfg.rateLimitSync != 100*time.Millisecond {
+				t.Errorf("rateLimitSync = %v, want 100ms", cfg.rateLimitSync)
 			}
 			if cfg.kafkaTopic != "clicks" {
 				t.Errorf("kafkaTopic = %q, want clicks", cfg.kafkaTopic)
@@ -68,10 +72,16 @@ func TestLoadConfig(t *testing.T) {
 		{name: "replication factor not a number", env: map[string]string{"CASSANDRA_REPLICATION_FACTOR": "three"}, wantErr: true},
 		{name: "rate limit not a number", env: map[string]string{"RATE_LIMIT_ANONYMOUS": "lots"}, wantErr: true},
 		{name: "rate limit zero", env: map[string]string{"RATE_LIMIT_USER": "0"}, wantErr: true},
+		{name: "exact rate limiting", env: map[string]string{"RATE_LIMIT_SYNC_INTERVAL": "0"}, check: func(t *testing.T, cfg config) {
+			if cfg.rateLimitSync != 0 {
+				t.Errorf("rateLimitSync = %v, want 0", cfg.rateLimitSync)
+			}
+		}},
+		{name: "sync interval not a duration", env: map[string]string{"RATE_LIMIT_SYNC_INTERVAL": "fast"}, wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			for _, k := range []string{"ADDR", "METRICS_ADDR", "BASE_URL", "STORAGE", "CASSANDRA_HOSTS", "CASSANDRA_KEYSPACE", "CASSANDRA_REPLICATION_FACTOR", "REDIS_ADDR", "POSTGRES_DSN", "KAFKA_BROKERS", "KAFKA_TOPIC", "CLICKHOUSE_DSN", "COUNTRY_HEADER", "RATE_LIMIT_ANONYMOUS", "RATE_LIMIT_USER"} {
+			for _, k := range []string{"ADDR", "METRICS_ADDR", "BASE_URL", "STORAGE", "CASSANDRA_HOSTS", "CASSANDRA_KEYSPACE", "CASSANDRA_REPLICATION_FACTOR", "REDIS_ADDR", "POSTGRES_DSN", "KAFKA_BROKERS", "KAFKA_TOPIC", "CLICKHOUSE_DSN", "COUNTRY_HEADER", "RATE_LIMIT_ANONYMOUS", "RATE_LIMIT_USER", "RATE_LIMIT_SYNC_INTERVAL"} {
 				if v, ok := tt.env[k]; ok {
 					t.Setenv(k, v)
 				} else {

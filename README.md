@@ -143,11 +143,12 @@ The network is not a bottleneck.
   When the limit is exceeded, the service returns `429 Too Many Requests` with `Retry-After: <seconds>`.
 
   Implementation details:
-  - **Fixed window** of one minute, a counter per subject in Redis (`INCR` + `EXPIRE` in one transaction), shared by all instances. The simplest algorithm; the trade-off is a burst of up to 2× the limit around a window boundary.
+  - **Fixed window** of one minute, a counter per subject in Redis, shared by all instances. The simplest algorithm; the trade-off is a burst of up to 2× the limit around a window boundary.
+  - **Counted in memory, synced in batches** (`RATE_LIMIT_SYNC_INTERVAL`, default 100 ms): each instance decides locally from the last global count it read plus its own unsynced requests, and flushes its increments to Redis (`INCRBY` + `EXPIRE` in one pipeline) every interval. This removes the per-request Redis transaction (12.8% of service CPU at 10K creates/s). The cost is accuracy: instances learn about each other's requests only when they sync, so together they can admit up to one sync interval's worth of extra requests per window. `RATE_LIMIT_SYNC_INTERVAL=0` restores exact per-request counting.
   - **Limits:** 100 requests/min per user, 10 requests/min per IP for requests without a valid API key (configurable with `RATE_LIMIT_USER` and `RATE_LIMIT_ANONYMOUS`).
   - The limit is checked **before** an invalid API key is rejected, so guessing keys counts against the IP quota.
   - The client IP is the TCP peer address. `X-Forwarded-For` is not trusted: behind a load balancer, read only the balancer's own header.
-  - If Redis is unavailable, requests are allowed (fail open): rate limiting must not take the API down.
+  - If Redis is unavailable, requests are allowed (fail open): rate limiting must not take the API down. With batched syncing, decisions continue from the last known counts, and unsynced increments are kept until Redis recovers.
   - Redirects (`GET /{key}`) are not rate limited.
 
 ### Endpoints
